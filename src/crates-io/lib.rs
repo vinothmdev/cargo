@@ -68,7 +68,10 @@ pub struct NewCrateDependency {
     pub version_req: String,
     pub target: Option<String>,
     pub kind: String,
-    #[serde(skip_serializing_if = "Option::is_none")] pub registry: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registry: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explicit_name_in_toml: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -83,6 +86,7 @@ pub struct User {
 pub struct Warnings {
     pub invalid_categories: Vec<String>,
     pub invalid_badges: Vec<String>,
+    pub other: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -220,9 +224,17 @@ impl Registry {
             .map(|x| x.iter().flat_map(|j| j.as_str()).map(Into::into).collect())
             .unwrap_or_else(Vec::new);
 
+        let other: Vec<String> = response
+            .get("warnings")
+            .and_then(|j| j.get("other"))
+            .and_then(|j| j.as_array())
+            .map(|x| x.iter().flat_map(|j| j.as_str()).map(Into::into).collect())
+            .unwrap_or_else(Vec::new);
+
         Ok(Warnings {
             invalid_categories,
             invalid_badges,
+            other,
         })
     }
 

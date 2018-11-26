@@ -1,13 +1,14 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 use core::interning::InternedString;
 use core::{Dependency, FeatureValue, PackageId, SourceId, Summary};
 use util::CargoResult;
 use util::Graph;
+use im_rc;
 
-use super::types::RegistryQueryer;
-use super::types::{ActivateResult, ConflictReason, DepInfo, GraphNode, Method, RcList};
+use super::errors::ActivateResult;
+use super::types::{ConflictReason, DepInfo, GraphNode, Method, RcList, RegistryQueryer};
 
 pub use super::encode::{EncodableDependency, EncodablePackageId, EncodableResolve};
 pub use super::encode::{Metadata, WorkspaceResolve};
@@ -19,12 +20,9 @@ pub use super::resolve::Resolve;
 // possible.
 #[derive(Clone)]
 pub struct Context {
-    // TODO: Both this and the two maps below are super expensive to clone. We should
-    //       switch to persistent hash maps if we can at some point or otherwise
-    //       make these much cheaper to clone in general.
     pub activations: Activations,
-    pub resolve_features: HashMap<PackageId, Rc<HashSet<InternedString>>>,
-    pub links: HashMap<InternedString, PackageId>,
+    pub resolve_features: im_rc::HashMap<PackageId, Rc<HashSet<InternedString>>>,
+    pub links: im_rc::HashMap<InternedString, PackageId>,
 
     // These are two cheaply-cloneable lists (O(1) clone) which are effectively
     // hash maps but are built up as "construction lists". We'll iterate these
@@ -36,16 +34,16 @@ pub struct Context {
     pub warnings: RcList<String>,
 }
 
-pub type Activations = HashMap<(InternedString, SourceId), Rc<Vec<Summary>>>;
+pub type Activations = im_rc::HashMap<(InternedString, SourceId), Rc<Vec<Summary>>>;
 
 impl Context {
     pub fn new() -> Context {
         Context {
             resolve_graph: RcList::new(),
-            resolve_features: HashMap::new(),
-            links: HashMap::new(),
+            resolve_features: im_rc::HashMap::new(),
+            links: im_rc::HashMap::new(),
             resolve_replacements: RcList::new(),
-            activations: HashMap::new(),
+            activations: im_rc::HashMap::new(),
             warnings: RcList::new(),
         }
     }
@@ -133,7 +131,7 @@ impl Context {
             .unwrap_or(&[])
     }
 
-    fn is_active(&self, id: &PackageId) -> bool {
+    pub fn is_active(&self, id: &PackageId) -> bool {
         self.activations
             .get(&(id.name(), id.source_id().clone()))
             .map(|v| v.iter().any(|s| s.package_id() == id))
@@ -145,7 +143,7 @@ impl Context {
     pub fn is_conflicting(
         &self,
         parent: Option<&PackageId>,
-        conflicting_activations: &HashMap<PackageId, ConflictReason>,
+        conflicting_activations: &BTreeMap<PackageId, ConflictReason>,
     ) -> bool {
         conflicting_activations
             .keys()
@@ -230,11 +228,13 @@ impl Context {
                     "Package `{}` does not have these features: `{}`",
                     s.package_id(),
                     features
-                ).into(),
+                )
+                .into(),
                 Some(p) => (
                     p.package_id().clone(),
                     ConflictReason::MissingFeatures(features),
-                ).into(),
+                )
+                    .into(),
             });
         }
 

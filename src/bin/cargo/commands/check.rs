@@ -4,6 +4,8 @@ use cargo::ops;
 
 pub fn cli() -> App {
     subcommand("check")
+        // subcommand aliases are handled in commands::builtin_exec() and cli::expand_aliases()
+        // .alias("c")
         .about("Check a local package and all of its dependencies for errors")
         .arg_package_spec(
             "Package(s) to check",
@@ -21,7 +23,7 @@ pub fn cli() -> App {
             "Check all tests",
             "Check only the specified bench target",
             "Check all benches",
-            "Check all targets (lib and bin targets by default)",
+            "Check all targets",
         )
         .arg_release("Check artifacts in release mode, with optimizations")
         .arg(opt("profile", "Profile to build the selected target for").value_name("PROFILE"))

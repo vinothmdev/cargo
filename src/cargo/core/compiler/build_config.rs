@@ -1,6 +1,8 @@
 use std::path::Path;
 use std::cell::RefCell;
 
+use serde::ser;
+
 use util::{CargoResult, CargoResultExt, Config, RustfixDiagnosticServer};
 
 /// Configuration information for a rustc build.
@@ -16,6 +18,8 @@ pub struct BuildConfig {
     pub mode: CompileMode,
     /// Whether to print std output in json format (for machine reading)
     pub message_format: MessageFormat,
+    /// Force cargo to do a full rebuild and treat each target as changed.
+    pub force_rebuild: bool,
     /// Output a build plan to stdout instead of actually compiling.
     pub build_plan: bool,
     /// Use Cargo itself as the wrapper around rustc, only used for `cargo fix`
@@ -79,6 +83,7 @@ impl BuildConfig {
             release: false,
             mode,
             message_format: MessageFormat::Human,
+            force_rebuild: false,
             build_plan: false,
             cargo_as_rustc_wrapper: false,
             extra_rustc_env: Vec::new(),
@@ -108,7 +113,7 @@ pub enum MessageFormat {
 /// `compile_ws` to tell it the general execution strategy.  This influences
 /// the default targets selected.  The other use is in the `Unit` struct
 /// to indicate what is being done with a specific target.
-#[derive(Clone, Copy, PartialEq, Debug, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Debug, Eq, Hash, PartialOrd, Ord)]
 pub enum CompileMode {
     /// A target being built for a test.
     Test,
@@ -131,6 +136,24 @@ pub enum CompileMode {
     /// A marker for Units that represent the execution of a `build.rs`
     /// script.
     RunCustomBuild,
+}
+
+impl ser::Serialize for CompileMode {
+    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: ser::Serializer,
+    {
+        use self::CompileMode::*;
+        match *self {
+            Test => "test".serialize(s),
+            Build => "build".serialize(s),
+            Check { .. } => "check".serialize(s),
+            Bench => "bench".serialize(s),
+            Doc { .. } => "doc".serialize(s),
+            Doctest => "doctest".serialize(s),
+            RunCustomBuild => "run-custom-build".serialize(s),
+        }
+    }
 }
 
 impl CompileMode {

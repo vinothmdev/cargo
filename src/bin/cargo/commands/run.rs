@@ -5,7 +5,8 @@ use cargo::ops::{self, CompileFilter};
 
 pub fn cli() -> App {
     subcommand("run")
-        .alias("r")
+        // subcommand aliases are handled in commands::builtin_exec() and cli::expand_aliases()
+        // .alias("r")
         .setting(AppSettings::TrailingVarArg)
         .about("Run the main binary of the local package (src/main.rs)")
         .arg(Arg::with_name("args").multiple(true))
@@ -23,7 +24,7 @@ pub fn cli() -> App {
         .arg_message_format()
         .after_help(
             "\
-If neither `--bin` nor `--example` are given, then if the project only has one
+If neither `--bin` nor `--example` are given, then if the package only has one
 bin target it will be run. Otherwise `--bin` specifies the bin target to run,
 and `--example` specifies the example target to run. At most one of `--bin` or
 `--example` can be provided.

@@ -4,10 +4,9 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 
 use semver::Version;
-use lazycell::LazyCell;
 
-use core::{Feature, Package, PackageId, Target, TargetKind};
-use util::{self, join_paths, process, CargoResult, Config, ProcessBuilder};
+use core::{Edition, Package, PackageId, Target, TargetKind};
+use util::{self, join_paths, process, CargoResult, CfgExpr, Config, ProcessBuilder};
 use super::BuildContext;
 
 pub struct Doctest {
@@ -22,11 +21,6 @@ pub struct Doctest {
 
 /// A structure returning the result of a compilation.
 pub struct Compilation<'cfg> {
-    /// A mapping from a package to the list of libraries that need to be
-    /// linked when working with that package.
-    // TODO: deprecated, remove
-    pub libraries: HashMap<PackageId, HashSet<(Target, PathBuf)>>,
-
     /// An array of all tests created during this compilation.
     pub tests: Vec<(Package, TargetKind, String, PathBuf)>,
 
@@ -39,7 +33,6 @@ pub struct Compilation<'cfg> {
     /// LD_LIBRARY_PATH as appropriate.
     ///
     /// The order should be deterministic.
-    // TODO: deprecated, remove
     pub native_dirs: BTreeSet<PathBuf>,
 
     /// Root output directory (for the local package's artifacts)
@@ -77,29 +70,36 @@ pub struct Compilation<'cfg> {
     config: &'cfg Config,
     rustc_process: ProcessBuilder,
 
-    target_runner: LazyCell<Option<(PathBuf, Vec<String>)>>,
+    target_runner: Option<(PathBuf, Vec<String>)>,
 }
 
 impl<'cfg> Compilation<'cfg> {
     pub fn new<'a>(bcx: &BuildContext<'a, 'cfg>) -> CargoResult<Compilation<'cfg>> {
-        let mut rustc = bcx.rustc.process();
+        // If we're using cargo as a rustc wrapper then we're in a situation
+        // like `cargo fix`. For now just disregard the `RUSTC_WRAPPER` env var
+        // (which is typically set to `sccache` for now). Eventually we'll
+        // probably want to implement `RUSTC_WRAPPER` for `cargo fix`, but we'll
+        // leave that open as a bug for now.
+        let mut rustc = if bcx.build_config.cargo_as_rustc_wrapper {
+            let mut rustc = bcx.rustc.process_no_wrapper();
+            let prog = rustc.get_program().to_owned();
+            rustc.env("RUSTC", prog);
+            rustc.program(env::current_exe()?);
+            rustc
+        } else {
+            bcx.rustc.process()
+        };
         for (k, v) in bcx.build_config.extra_rustc_env.iter() {
             rustc.env(k, v);
         }
         for arg in bcx.build_config.extra_rustc_args.iter() {
             rustc.arg(arg);
         }
-        if bcx.build_config.cargo_as_rustc_wrapper {
-            let prog = rustc.get_program().to_owned();
-            rustc.env("RUSTC", prog);
-            rustc.program(env::current_exe()?);
-        }
         let srv = bcx.build_config.rustfix_diagnostic_server.borrow();
         if let Some(server) = &*srv {
             server.configure(&mut rustc);
         }
         Ok(Compilation {
-            libraries: HashMap::new(),
             native_dirs: BTreeSet::new(), // TODO: deprecated, remove
             root_output: PathBuf::from("/"),
             deps_output: PathBuf::from("/"),
@@ -116,15 +116,14 @@ impl<'cfg> Compilation<'cfg> {
             rustc_process: rustc,
             host: bcx.host_triple().to_string(),
             target: bcx.target_triple().to_string(),
-            target_runner: LazyCell::new(),
+            target_runner: target_runner(&bcx)?,
         })
     }
 
     /// See `process`.
     pub fn rustc_process(&self, pkg: &Package, target: &Target) -> CargoResult<ProcessBuilder> {
         let mut p = self.fill_env(self.rustc_process.clone(), pkg, true)?;
-        let manifest = pkg.manifest();
-        if manifest.features().is_enabled(Feature::edition()) {
+        if target.edition() != Edition::Edition2015 {
             p.arg(format!("--edition={}", target.edition()));
         }
         Ok(p)
@@ -133,9 +132,7 @@ impl<'cfg> Compilation<'cfg> {
     /// See `process`.
     pub fn rustdoc_process(&self, pkg: &Package, target: &Target) -> CargoResult<ProcessBuilder> {
         let mut p = self.fill_env(process(&*self.config.rustdoc()?), pkg, false)?;
-        let manifest = pkg.manifest();
-        if manifest.features().is_enabled(Feature::edition()) {
-            p.arg("-Zunstable-options");
+        if target.edition() != Edition::Edition2015 {
             p.arg(format!("--edition={}", target.edition()));
         }
         Ok(p)
@@ -150,11 +147,8 @@ impl<'cfg> Compilation<'cfg> {
         self.fill_env(process(cmd), pkg, true)
     }
 
-    fn target_runner(&self) -> CargoResult<&Option<(PathBuf, Vec<String>)>> {
-        self.target_runner.try_borrow_with(|| {
-            let key = format!("target.{}.runner", self.target);
-            Ok(self.config.get_path_and_args(&key)?.map(|v| v.val))
-        })
+    fn target_runner(&self) -> &Option<(PathBuf, Vec<String>)> {
+        &self.target_runner
     }
 
     /// See `process`.
@@ -163,7 +157,7 @@ impl<'cfg> Compilation<'cfg> {
         cmd: T,
         pkg: &Package,
     ) -> CargoResult<ProcessBuilder> {
-        let builder = if let Some((ref runner, ref args)) = *self.target_runner()? {
+        let builder = if let Some((ref runner, ref args)) = *self.target_runner() {
             let mut builder = process(runner);
             builder.args(args);
             builder.arg(cmd);
@@ -192,8 +186,8 @@ impl<'cfg> Compilation<'cfg> {
         } else {
             let mut search_path =
                 super::filter_dynamic_search_path(self.native_dirs.iter(), &self.root_output);
-            search_path.push(self.root_output.clone());
             search_path.push(self.deps_output.clone());
+            search_path.push(self.root_output.clone());
             search_path.extend(self.target_dylib_path.clone());
             search_path
         };
@@ -235,6 +229,10 @@ impl<'cfg> Compilation<'cfg> {
                 "CARGO_PKG_HOMEPAGE",
                 metadata.homepage.as_ref().unwrap_or(&String::new()),
             )
+            .env(
+                "CARGO_PKG_REPOSITORY",
+                metadata.repository.as_ref().unwrap_or(&String::new()),
+            )
             .env("CARGO_PKG_AUTHORS", &pkg.authors().join(":"))
             .cwd(pkg.root());
         Ok(cmd)
@@ -256,4 +254,40 @@ fn pre_version_component(v: &Version) -> String {
     }
 
     ret
+}
+
+fn target_runner(bcx: &BuildContext) -> CargoResult<Option<(PathBuf, Vec<String>)>> {
+    let target = bcx.target_triple();
+
+    // try target.{}.runner
+    let key = format!("target.{}.runner", target);
+    if let Some(v) = bcx.config.get_path_and_args(&key)? {
+        return Ok(Some(v.val));
+    }
+
+    // try target.'cfg(...)'.runner
+    if let Some(target_cfg) = bcx.target_info.cfg() {
+        if let Some(table) = bcx.config.get_table("target")? {
+            let mut matching_runner = None;
+
+            for key in table.val.keys() {
+                if CfgExpr::matches_key(key, target_cfg) {
+                    let key = format!("target.{}.runner", key);
+                    if let Some(runner) = bcx.config.get_path_and_args(&key)? {
+                        // more than one match, error out
+                        if matching_runner.is_some() {
+                            bail!("several matching instances of `target.'cfg(..)'.runner` \
+                                   in `.cargo/config`")
+                        }
+
+                        matching_runner = Some(runner.val);
+                    }
+                }
+            }
+
+            return Ok(matching_runner);
+        }
+    }
+
+    Ok(None)
 }

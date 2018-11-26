@@ -1,6 +1,5 @@
 use support::rustc_host;
-use support::{basic_lib_manifest, execs, project, path2url};
-use support::hamcrest::assert_that;
+use support::{basic_lib_manifest, project};
 
 #[test]
 fn pathless_tools() {
@@ -19,26 +18,21 @@ fn pathless_tools() {
         "#,
                 target
             ),
-        )
-        .build();
+        ).build();
 
-    assert_that(
-        foo.cargo("build --verbose"),
-        execs().with_stderr(&format!(
+    foo.cargo("build --verbose")
+        .with_stderr(
             "\
-[COMPILING] foo v0.5.0 ({url})
+[COMPILING] foo v0.5.0 ([CWD])
 [RUNNING] `rustc [..] -C ar=nonexistent-ar -C linker=nonexistent-linker [..]`
 [FINISHED] dev [unoptimized + debuginfo] target(s) in [..]
 ",
-            url = foo.url()
-        )),
-    )
+        ).run();
 }
 
 #[test]
 fn absolute_tools() {
     let target = rustc_host();
-    let root = if cfg!(windows) { r#"C:\"# } else { "/" };
 
     // Escaped as they appear within a TOML config file
     let config = if cfg!(windows) {
@@ -65,21 +59,13 @@ fn absolute_tools() {
                 ar = config.0,
                 linker = config.1
             ),
-        )
-        .build();
+        ).build();
 
-    assert_that(
-        foo.cargo("build --verbose"),
-        execs().with_stderr(&format!(
-            "\
-[COMPILING] foo v0.5.0 ({url})
-[RUNNING] `rustc [..] -C ar={root}bogus/nonexistent-ar -C linker={root}bogus/nonexistent-linker [..]`
+    foo.cargo("build --verbose").with_stderr("\
+[COMPILING] foo v0.5.0 ([CWD])
+[RUNNING] `rustc [..] -C ar=[ROOT]bogus/nonexistent-ar -C linker=[ROOT]bogus/nonexistent-linker [..]`
 [FINISHED] dev [unoptimized + debuginfo] target(s) in [..]
-",
-            url = foo.url(),
-            root = root,
-        )),
-    )
+").run();
 }
 
 #[test]
@@ -111,25 +97,18 @@ fn relative_tools() {
                 ar = config.0,
                 linker = config.1
             ),
-        )
-        .build();
+        ).build();
 
-    let foo_path = p.root().join("bar");
-    let foo_url = path2url(&foo_path);
     let prefix = p.root().into_os_string().into_string().unwrap();
 
-    assert_that(
-        p.cargo("build --verbose").cwd(foo_path),
-        execs().with_stderr(&format!(
+    p.cargo("build --verbose").cwd(p.root().join("bar")).with_stderr(&format!(
             "\
-[COMPILING] bar v0.5.0 ({url})
+[COMPILING] bar v0.5.0 ([CWD])
 [RUNNING] `rustc [..] -C ar={prefix}/./nonexistent-ar -C linker={prefix}/./tools/nonexistent-linker [..]`
 [FINISHED] dev [unoptimized + debuginfo] target(s) in [..]
 ",
-            url = foo_url,
             prefix = prefix,
-        )),
-    )
+        )).run();
 }
 
 #[test]
@@ -149,45 +128,118 @@ fn custom_runner() {
         "#,
                 target
             ),
-        )
-        .build();
+        ).build();
 
-    assert_that(
-        p.cargo("run -- --param"),
-        execs().with_status(101).with_stderr_contains(&format!(
+    p.cargo("run -- --param")
+        .with_status(101)
+        .with_stderr_contains(
             "\
-[COMPILING] foo v0.0.1 ({url})
+[COMPILING] foo v0.0.1 ([CWD])
 [FINISHED] dev [unoptimized + debuginfo] target(s) in [..]
 [RUNNING] `nonexistent-runner -r target/debug/foo[EXE] --param`
 ",
-            url = p.url()
-        )),
-    );
+        ).run();
 
-    assert_that(
-        p.cargo("test --test test --verbose -- --param"),
-        execs().with_status(101).with_stderr_contains(&format!(
+    p.cargo("test --test test --verbose -- --param")
+        .with_status(101)
+        .with_stderr_contains(
             "\
-[COMPILING] foo v0.0.1 ({url})
+[COMPILING] foo v0.0.1 ([CWD])
 [RUNNING] `rustc [..]`
 [FINISHED] dev [unoptimized + debuginfo] target(s) in [..]
 [RUNNING] `nonexistent-runner -r [..]/target/debug/deps/test-[..][EXE] --param`
 ",
-            url = p.url()
-        )),
-    );
+        ).run();
 
-    assert_that(
-        p.cargo("bench --bench bench --verbose -- --param"),
-        execs().with_status(101).with_stderr_contains(&format!(
+    p.cargo("bench --bench bench --verbose -- --param")
+        .with_status(101)
+        .with_stderr_contains(
             "\
-[COMPILING] foo v0.0.1 ({url})
+[COMPILING] foo v0.0.1 ([CWD])
 [RUNNING] `rustc [..]`
 [RUNNING] `rustc [..]`
 [FINISHED] release [optimized] target(s) in [..]
 [RUNNING] `nonexistent-runner -r [..]/target/release/deps/bench-[..][EXE] --param --bench`
 ",
-            url = p.url()
-        )),
-    );
+        ).run();
+}
+
+// can set a custom runner via `target.'cfg(..)'.runner`
+#[test]
+fn custom_runner_cfg() {
+    let p = project()
+        .file("src/main.rs", "fn main() {}")
+        .file(
+            ".cargo/config",
+            r#"
+            [target.'cfg(not(target_os = "none"))']
+            runner = "nonexistent-runner -r"
+            "#,
+        ).build();
+
+    p.cargo("run -- --param")
+        .with_status(101)
+        .with_stderr_contains(&format!(
+            "\
+[COMPILING] foo v0.0.1 ([CWD])
+[FINISHED] dev [unoptimized + debuginfo] target(s) in [..]
+[RUNNING] `nonexistent-runner -r target/debug/foo[EXE] --param`
+",
+        )).run();
+}
+
+// custom runner set via `target.$triple.runner` have precende over `target.'cfg(..)'.runner`
+#[test]
+fn custom_runner_cfg_precedence() {
+    let target = rustc_host();
+
+    let p = project()
+        .file("src/main.rs", "fn main() {}")
+        .file(
+            ".cargo/config",
+            &format!(
+                r#"
+            [target.'cfg(not(target_os = "none"))']
+            runner = "ignored-runner"
+
+            [target.{}]
+            runner = "nonexistent-runner -r"
+        "#,
+                target
+            ),
+        ).build();
+
+    p.cargo("run -- --param")
+        .with_status(101)
+        .with_stderr_contains(&format!(
+            "\
+            [COMPILING] foo v0.0.1 ([CWD])
+[FINISHED] dev [unoptimized + debuginfo] target(s) in [..]
+[RUNNING] `nonexistent-runner -r target/debug/foo[EXE] --param`
+",
+        )).run();
+}
+
+#[test]
+fn custom_runner_cfg_collision() {
+    let p = project()
+        .file("src/main.rs", "fn main() {}")
+        .file(
+            ".cargo/config",
+            r#"
+            [target.'cfg(not(target_arch = "avr"))']
+            runner = "true"
+
+            [target.'cfg(not(target_os = "none"))']
+            runner = "false"
+            "#,
+        ).build();
+
+    p.cargo("run -- --param")
+        .with_status(101)
+        .with_stderr_contains(&format!(
+            "\
+[ERROR] several matching instances of `target.'cfg(..)'.runner` in `.cargo/config`
+",
+        )).run();
 }

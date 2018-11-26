@@ -16,7 +16,7 @@ use util::profile;
 pub fn resolve_ws<'a>(ws: &Workspace<'a>) -> CargoResult<(PackageSet<'a>, Resolve)> {
     let mut registry = PackageRegistry::new(ws.config())?;
     let resolve = resolve_with_registry(ws, &mut registry, true)?;
-    let packages = get_resolved_packages(&resolve, registry);
+    let packages = get_resolved_packages(&resolve, registry)?;
     Ok((packages, resolve))
 }
 
@@ -96,7 +96,7 @@ pub fn resolve_ws_with_method<'a>(
         true,
     )?;
 
-    let packages = get_resolved_packages(&resolved_with_overrides, registry);
+    let packages = get_resolved_packages(&resolved_with_overrides, registry)?;
 
     Ok((packages, resolved_with_overrides))
 }
@@ -150,7 +150,7 @@ pub fn resolve_with_previous<'a, 'cfg>(
     //
     // TODO: This seems like a hokey reason to single out the registry as being
     //       different
-    let mut to_avoid_sources = HashSet::new();
+    let mut to_avoid_sources: HashSet<&SourceId> = HashSet::new();
     if let Some(to_avoid) = to_avoid {
         to_avoid_sources.extend(
             to_avoid
@@ -161,7 +161,7 @@ pub fn resolve_with_previous<'a, 'cfg>(
     }
 
     let keep = |p: &&'a PackageId| {
-        !to_avoid_sources.contains(&p.source_id()) && match to_avoid {
+        !to_avoid_sources.contains(p.source_id()) && match to_avoid {
             Some(set) => !set.contains(p),
             None => true,
         }
@@ -374,7 +374,7 @@ pub fn add_overrides<'a>(
 pub fn get_resolved_packages<'a>(
     resolve: &Resolve,
     registry: PackageRegistry<'a>,
-) -> PackageSet<'a> {
+) -> CargoResult<PackageSet<'a>> {
     let ids: Vec<PackageId> = resolve.iter().cloned().collect();
     registry.get(&ids)
 }

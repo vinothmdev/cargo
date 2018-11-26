@@ -9,7 +9,7 @@ use serde::de::{self, Deserialize};
 use serde::ser;
 use serde_json;
 
-use core::{Edition, Package, TargetKind};
+use core::{Edition, Package};
 use util;
 use util::errors::{CargoResult, CargoResultExt};
 use util::paths;
@@ -466,7 +466,6 @@ fn calculate<'a, 'cfg>(
         unit.mode,
         bcx.extra_args_for(unit),
         cx.incremental_args(unit)?,
-        cx.used_in_plugin.contains(unit), // used when passing panic=abort
     ));
     let fingerprint = Arc::new(Fingerprint {
         rustc: util::hash_u64(&bcx.rustc.verbose_version),
@@ -781,14 +780,7 @@ fn filename<'a, 'cfg>(cx: &mut Context<'a, 'cfg>, unit: &Unit<'a>) -> String {
     // fingerprint for every metadata hash version. This works because
     // even if the package is fresh, we'll still link the fresh target
     let file_stem = cx.files().file_stem(unit);
-    let kind = match *unit.target.kind() {
-        TargetKind::Lib(..) => "lib",
-        TargetKind::Bin => "bin",
-        TargetKind::Test => "integration-test",
-        TargetKind::ExampleBin | TargetKind::ExampleLib(..) => "example",
-        TargetKind::Bench => "bench",
-        TargetKind::CustomBuild => "build-script",
-    };
+    let kind = unit.target.kind().description();
     let flavor = if unit.mode.is_any_test() {
         "test-"
     } else if unit.mode.is_doc() {

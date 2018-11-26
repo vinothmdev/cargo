@@ -206,6 +206,23 @@ fn clean_lib(
     // A plugin requires exporting plugin_registrar so a crate cannot be
     // both at once.
     let crate_types = match (lib.crate_types(), lib.plugin, lib.proc_macro()) {
+        (Some(kinds), _, _) if kinds.contains(&"proc-macro".to_string()) => {
+            if let Some(true) = lib.plugin {
+                // This is a warning to retain backwards compatibility.
+                warnings.push(format!(
+                    "proc-macro library `{}` should not specify `plugin = true`",
+                    lib.name()
+                ));
+            }
+            warnings.push(format!(
+                "library `{}` should only specify `proc-macro = true` instead of setting `crate-type`",
+                lib.name()
+            ));
+            if kinds.len() > 1 {
+                bail!("cannot mix `proc-macro` crate type with others");
+            }
+            vec![LibKind::ProcMacro]
+        }
         (_, Some(true), Some(true)) => bail!("lib.plugin and lib.proc-macro cannot both be true"),
         (Some(kinds), _, _) => kinds.iter().map(|s| s.into()).collect(),
         (None, Some(true), _) => vec![LibKind::Dylib],
@@ -617,7 +634,12 @@ fn toml_targets_and_inferred(
 ) -> Vec<TomlTarget> {
     let inferred_targets = inferred_to_toml_targets(inferred);
     match toml_targets {
-        None => inferred_targets,
+        None =>
+            if let Some(false) = autodiscover {
+                vec![]
+            } else {
+                inferred_targets
+            },
         Some(targets) => {
             let mut targets = targets.clone();
 

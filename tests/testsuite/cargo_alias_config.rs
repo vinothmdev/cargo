@@ -1,5 +1,4 @@
-use support::{basic_bin_manifest, execs, project};
-use support::hamcrest::assert_that;
+use support::{basic_bin_manifest, project};
 
 #[test]
 fn alias_incorrect_config_type() {
@@ -12,38 +11,15 @@ fn alias_incorrect_config_type() {
             [alias]
             b-cargo-test = 5
         "#,
-        )
-        .build();
+        ).build();
 
-    assert_that(
-        p.cargo("b-cargo-test -v"),
-        execs().with_status(101).with_stderr_contains(
+    p.cargo("b-cargo-test -v")
+        .with_status(101)
+        .with_stderr_contains(
             "\
 [ERROR] invalid configuration for key `alias.b-cargo-test`
 expected a list, but found a integer for [..]",
-        ),
-    );
-}
-
-#[test]
-fn alias_default_config_overrides_config() {
-    let p = project()
-        .file("Cargo.toml", &basic_bin_manifest("foo"))
-        .file("src/main.rs", "fn main() {}")
-        .file(
-            ".cargo/config",
-            r#"
-            [alias]
-            b = "not_build"
-        "#,
-        )
-        .build();
-
-    assert_that(
-        p.cargo("b -v"),
-        execs()
-            .with_stderr_contains("[COMPILING] foo v0.5.0 [..]"),
-    );
+        ).run();
 }
 
 #[test]
@@ -57,18 +33,14 @@ fn alias_config() {
             [alias]
             b-cargo-test = "build"
         "#,
-        )
-        .build();
+        ).build();
 
-    assert_that(
-        p.cargo("b-cargo-test -v"),
-        execs()
-            .with_stderr_contains(
-                "\
+    p.cargo("b-cargo-test -v")
+        .with_stderr_contains(
+            "\
 [COMPILING] foo v0.5.0 [..]
 [RUNNING] `rustc --crate-name foo [..]",
-            ),
-    );
+        ).run();
 }
 
 #[test]
@@ -83,17 +55,14 @@ fn recursive_alias() {
             b-cargo-test = "build"
             a-cargo-test = ["b-cargo-test", "-v"]
         "#,
-        )
-        .build();
+        ).build();
 
-    assert_that(
-        p.cargo("a-cargo-test"),
-        execs().with_stderr_contains(
+    p.cargo("a-cargo-test")
+        .with_stderr_contains(
             "\
 [COMPILING] foo v0.5.0 [..]
 [RUNNING] `rustc --crate-name foo [..]",
-        ),
-    );
+        ).run();
 }
 
 #[test]
@@ -107,15 +76,12 @@ fn alias_list_test() {
             [alias]
             b-cargo-test = ["build", "--release"]
          "#,
-        )
-        .build();
+        ).build();
 
-    assert_that(
-        p.cargo("b-cargo-test -v"),
-        execs()
-            .with_stderr_contains("[COMPILING] foo v0.5.0 [..]")
-            .with_stderr_contains("[RUNNING] `rustc --crate-name [..]"),
-    );
+    p.cargo("b-cargo-test -v")
+        .with_stderr_contains("[COMPILING] foo v0.5.0 [..]")
+        .with_stderr_contains("[RUNNING] `rustc --crate-name [..]")
+        .run();
 }
 
 #[test]
@@ -129,19 +95,16 @@ fn alias_with_flags_config() {
             [alias]
             b-cargo-test = "build --release"
          "#,
-        )
-        .build();
+        ).build();
 
-    assert_that(
-        p.cargo("b-cargo-test -v"),
-        execs()
-            .with_stderr_contains("[COMPILING] foo v0.5.0 [..]")
-            .with_stderr_contains("[RUNNING] `rustc --crate-name foo [..]"),
-    );
+    p.cargo("b-cargo-test -v")
+        .with_stderr_contains("[COMPILING] foo v0.5.0 [..]")
+        .with_stderr_contains("[RUNNING] `rustc --crate-name foo [..]")
+        .run();
 }
 
 #[test]
-fn cant_shadow_builtin() {
+fn alias_cannot_shadow_builtin_command() {
     let p = project()
         .file("Cargo.toml", &basic_bin_manifest("foo"))
         .file("src/main.rs", "fn main() {}")
@@ -151,17 +114,37 @@ fn cant_shadow_builtin() {
             [alias]
             build = "fetch"
          "#,
-        )
-        .build();
+        ).build();
 
-    assert_that(
-        p.cargo("build"),
-        execs().with_stderr(
+    p.cargo("build")
+        .with_stderr(
             "\
-[WARNING] alias `build` is ignored, because it is shadowed by a built in command
+[WARNING] user-defined alias `build` is ignored, because it is shadowed by a built-in command
 [COMPILING] foo v0.5.0 ([..])
 [FINISHED] dev [unoptimized + debuginfo] target(s) in [..]
 ",
-        ),
-    );
+        ).run();
+}
+
+#[test]
+fn alias_override_builtin_alias() {
+    let p = project()
+        .file("Cargo.toml", &basic_bin_manifest("foo"))
+        .file("src/main.rs", "fn main() {}")
+        .file(
+            ".cargo/config",
+            r#"
+            [alias]
+            b = "run"
+         "#,
+        ).build();
+
+    p.cargo("b")
+        .with_stderr(
+            "\
+[COMPILING] foo v0.5.0 ([..])
+[FINISHED] dev [unoptimized + debuginfo] target(s) in [..]
+[RUNNING] `target/debug/foo[EXE]`
+",
+        ).run();
 }

@@ -2,16 +2,17 @@ use std::path::PathBuf;
 use std::fs;
 
 use clap::{self, SubCommand};
-use cargo::CargoResult;
-use cargo::core::Workspace;
-use cargo::core::compiler::{BuildConfig, MessageFormat};
-use cargo::ops::{CompileFilter, CompileOptions, NewOptions, Packages, VersionControl};
-use cargo::util::paths;
-use cargo::util::important_paths::find_root_manifest_for_wd;
+use CargoResult;
+use core::Workspace;
+use core::compiler::{BuildConfig, MessageFormat};
+use ops::{CompileFilter, CompileOptions, NewOptions, Packages, VersionControl};
+use sources::CRATES_IO_REGISTRY;
+use util::paths;
+use util::important_paths::find_root_manifest_for_wd;
 
 pub use clap::{AppSettings, Arg, ArgMatches};
-pub use cargo::{CliError, CliResult, Config};
-pub use cargo::core::compiler::CompileMode;
+pub use {CliError, CliResult, Config};
+pub use core::compiler::CompileMode;
 
 pub type App = clap::App<'static, 'static>;
 
@@ -147,8 +148,14 @@ pub trait AppExt: Sized {
                  a global configuration.",
             ).value_name("VCS")
                 .possible_values(&["git", "hg", "pijul", "fossil", "none"]),
-        )._arg(opt("bin", "Use a binary (application) template [default]"))
+        )
+            ._arg(opt("bin", "Use a binary (application) template [default]"))
             ._arg(opt("lib", "Use a library template"))
+            ._arg(
+                opt("edition", "Edition to set for the crate generated")
+                    .possible_values(&["2015", "2018"])
+                    .value_name("YEAR")
+            )
             ._arg(
                 opt(
                     "name",
@@ -309,6 +316,7 @@ pub trait ArgMatchesExt {
             ),
             target_rustdoc_args: None,
             target_rustc_args: None,
+            local_rustdoc_args: None,
             export_dir: None,
         };
         Ok(opts)
@@ -339,6 +347,8 @@ pub trait ArgMatchesExt {
             self._is_present("lib"),
             self.value_of_path("path", config).unwrap(),
             self._value_of("name").map(|s| s.to_string()),
+            self._value_of("edition").map(|s| s.to_string()),
+            self.registry(config)?,
         )
     }
 
@@ -351,9 +361,22 @@ pub trait ArgMatchesExt {
                          requires -Zunstable-options to use."
                     ));
                 }
-                Ok(Some(registry.to_string()))
+
+                if registry == CRATES_IO_REGISTRY {
+                    // If "crates.io" is specified then we just need to return None
+                    // as that will cause cargo to use crates.io. This is required
+                    // for the case where a default alterative registry is used
+                    // but the user wants to switch back to crates.io for a single
+                    // command.
+                    Ok(None)
+                }
+                else {
+                    Ok(Some(registry.to_string()))                    
+                }
             }
-            None => Ok(None),
+            None => {
+                config.default_registry()
+            }
         }
     }
 

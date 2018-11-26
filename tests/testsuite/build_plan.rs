@@ -1,6 +1,5 @@
-use support::ChannelChanger;
-use support::{basic_manifest, basic_bin_manifest, execs, main_file, project};
-use support::hamcrest::{assert_that, existing_file, is_not};
+use support::registry::Package;
+use support::{basic_bin_manifest, basic_manifest, main_file, project};
 
 #[test]
 fn cargo_build_plan_simple() {
@@ -9,10 +8,9 @@ fn cargo_build_plan_simple() {
         .file("src/foo.rs", &main_file(r#""i am foo""#, &[]))
         .build();
 
-    assert_that(
-        p.cargo("build --build-plan -Zunstable-options")
-            .masquerade_as_nightly_cargo(),
-        execs().with_json(
+    p.cargo("build --build-plan -Zunstable-options")
+        .masquerade_as_nightly_cargo()
+        .with_json(
             r#"
     {
         "inputs": [
@@ -30,14 +28,14 @@ fn cargo_build_plan_simple() {
                 "package_name": "foo",
                 "package_version": "0.5.0",
                 "program": "rustc",
-                "target_kind": ["bin"]
+                "target_kind": ["bin"],
+                "compile_mode": "build"
             }
         ]
     }
     "#,
-        ),
-    );
-    assert_that(&p.bin("foo"), is_not(existing_file()));
+        ).run();
+    assert!(!p.bin("foo").is_file());
 }
 
 #[test]
@@ -54,8 +52,7 @@ fn cargo_build_plan_single_dep() {
             [dependencies]
             bar = { path = "bar" }
         "#,
-        )
-        .file(
+        ).file(
             "src/lib.rs",
             r#"
             extern crate bar;
@@ -64,14 +61,12 @@ fn cargo_build_plan_single_dep() {
             #[test]
             fn test() { foo(); }
         "#,
-        )
-        .file("bar/Cargo.toml", &basic_manifest("bar", "0.0.1"))
+        ).file("bar/Cargo.toml", &basic_manifest("bar", "0.0.1"))
         .file("bar/src/lib.rs", "pub fn bar() {}")
         .build();
-    assert_that(
-        p.cargo("build --build-plan -Zunstable-options")
-            .masquerade_as_nightly_cargo(),
-        execs().with_json(
+    p.cargo("build --build-plan -Zunstable-options")
+        .masquerade_as_nightly_cargo()
+        .with_json(
             r#"
     {
         "inputs": [
@@ -92,7 +87,8 @@ fn cargo_build_plan_single_dep() {
                 "package_name": "bar",
                 "package_version": "0.0.1",
                 "program": "rustc",
-                "target_kind": ["lib"]
+                "target_kind": ["lib"],
+                "compile_mode": "build"
             },
             {
                 "args": "{...}",
@@ -107,13 +103,13 @@ fn cargo_build_plan_single_dep() {
                 "package_name": "foo",
                 "package_version": "0.5.0",
                 "program": "rustc",
-                "target_kind": ["lib"]
+                "target_kind": ["lib"],
+                "compile_mode": "build"
             }
         ]
     }
     "#,
-        ),
-    );
+        ).run();
 }
 
 #[test]
@@ -129,15 +125,13 @@ fn cargo_build_plan_build_script() {
             authors = ["wycats@example.com"]
             build = "build.rs"
         "#,
-        )
-        .file("src/main.rs", r#"fn main() {}"#)
+        ).file("src/main.rs", r#"fn main() {}"#)
         .file("build.rs", r#"fn main() {}"#)
         .build();
 
-    assert_that(
-        p.cargo("build --build-plan -Zunstable-options")
-            .masquerade_as_nightly_cargo(),
-        execs().with_json(
+    p.cargo("build --build-plan -Zunstable-options")
+        .masquerade_as_nightly_cargo()
+        .with_json(
             r#"
     {
         "inputs": [
@@ -157,7 +151,8 @@ fn cargo_build_plan_build_script() {
                 "package_name": "foo",
                 "package_version": "0.5.0",
                 "program": "rustc",
-                "target_kind": ["custom-build"]
+                "target_kind": ["custom-build"],
+                "compile_mode": "build"
             },
             {
                 "args": "{...}",
@@ -170,7 +165,8 @@ fn cargo_build_plan_build_script() {
                 "package_name": "foo",
                 "package_version": "0.5.0",
                 "program": "[..]/build-script-build",
-                "target_kind": ["custom-build"]
+                "target_kind": ["custom-build"],
+                "compile_mode": "run-custom-build"
             },
             {
                 "args": "{...}",
@@ -183,11 +179,36 @@ fn cargo_build_plan_build_script() {
                 "package_name": "foo",
                 "package_version": "0.5.0",
                 "program": "rustc",
-                "target_kind": ["bin"]
+                "target_kind": ["bin"],
+                "compile_mode": "build"
             }
         ]
     }
     "#,
-        ),
-    );
+        ).run();
+}
+
+#[test]
+fn build_plan_with_dev_dep() {
+    Package::new("bar", "0.1.0").publish();
+
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [project]
+                name = "foo"
+                version = "0.5.0"
+                authors = []
+
+                [dev-dependencies]
+                bar = "*"
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .build();
+
+    p.cargo("build --build-plan -Zunstable-options")
+        .masquerade_as_nightly_cargo()
+        .run();
 }

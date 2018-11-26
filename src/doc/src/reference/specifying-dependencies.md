@@ -113,10 +113,11 @@ rand = { git = "https://github.com/rust-lang-nursery/rand" }
 
 Cargo will fetch the `git` repository at this location then look for a
 `Cargo.toml` for the requested crate anywhere inside the `git` repository
-(not necessarily at the root).
+(not necessarily at the root - for example, specifying a member crate name
+of a workspace and setting `git` to the repository containing the workspace).
 
 Since we haven’t specified any other information, Cargo assumes that
-we intend to use the latest commit on the `master` branch to build our project.
+we intend to use the latest commit on the `master` branch to build our package.
 You can combine the `git` key with the `rev`, `tag`, or `branch` keys to
 specify something else. Here's an example of specifying that you want to use
 the latest commit on a branch named `next`:
@@ -128,11 +129,11 @@ rand = { git = "https://github.com/rust-lang-nursery/rand", branch = "next" }
 
 ### Specifying path dependencies
 
-Over time, our `hello_world` project from [the guide](guide/index.html) has
+Over time, our `hello_world` package from [the guide](guide/index.html) has
 grown significantly in size! It’s gotten to the point that we probably want to
 split out a separate crate for others to use. To do this Cargo supports **path
 dependencies** which are typically sub-crates that live within one repository.
-Let’s start off by making a new crate inside of our `hello_world` project:
+Let’s start off by making a new crate inside of our `hello_world` package:
 
 ```console
 # inside of hello_world/
@@ -182,7 +183,7 @@ example:
 * An upstream crate you don't work on has a new feature or a bug fix on the
   master branch of its git repository which you'd like to test out.
 * You're about to publish a new major version of your crate, but you'd like to
-  do integration testing across an entire project to ensure the new major
+  do integration testing across an entire package to ensure the new major
   version works.
 * You've submitted a fix to an upstream crate for a bug you found, but you'd
   like to immediately have your application start depending on the fixed version
@@ -198,11 +199,11 @@ section here.
 
 ### Testing a bugfix
 
-Let's say you're working with the [`uuid`] crate but while you're working on it
+Let's say you're working with the [`uuid` crate] but while you're working on it
 you discover a bug. You are, however, quite enterprising so you decide to also
-try out to fix the bug! Originally your manifest will look like:
+try to fix the bug! Originally your manifest will look like:
 
-[`uuid`](https://crates.io/crates/uuid)
+[`uuid` crate]: https://crates.io/crates/uuid
 
 ```toml
 [package]
@@ -230,10 +231,10 @@ uuid = { path = "../path/to/uuid" }
 
 Here we declare that we're *patching* the source `crates-io` with a new
 dependency. This will effectively add the local checked out version of `uuid` to
-the crates.io registry for our local project.
+the crates.io registry for our local package.
 
 Next up we need to ensure that our lock file is updated to use this new version
-of `uuid` so our project uses the locally checked out copy instead of one from
+of `uuid` so our package uses the locally checked out copy instead of one from
 crates.io. The way `[patch]` works is that it'll load the dependency at
 `../path/to/uuid` and then whenever crates.io is queried for versions of `uuid`
 it'll *also* return the local version.
@@ -250,13 +251,13 @@ In any case, typically all you need to do now is:
 
 ```console
 $ cargo build
-   Compiling uuid v1.0.0 (file://.../uuid)
-   Compiling my-library v0.1.0 (file://.../my-library)
+   Compiling uuid v1.0.0 (.../uuid)
+   Compiling my-library v0.1.0 (.../my-library)
     Finished dev [unoptimized + debuginfo] target(s) in 0.32 secs
 ```
 
 And that's it! You're now building with the local version of `uuid` (note the
-`file://` in the build output). If you don't see the `file://` version getting
+path in parentheses in the build output). If you don't see the local path version getting
 built then you may need to run `cargo update -p uuid --precise $version` where
 `$version` is the version of the locally checked out copy of `uuid`.
 
@@ -310,7 +311,7 @@ from crates.io. Once 1.0.1 is published on crates.io the `[patch]` section can
 be deleted.
 
 It's also worth noting that `[patch]` applies *transitively*. Let's say you use
-`my-library` in a larger project, such as:
+`my-library` in a larger package, such as:
 
 ```toml
 [package]
@@ -376,7 +377,7 @@ my-library = { git = 'https://example.com/git/my-library' }
 uuid = "1.0"
 
 [patch.crates-io]
-uuid = { git = 'https://github.com/rust-lang-nursery/uuid', version = '2.0.0' }
+uuid = { git = 'https://github.com/rust-lang-nursery/uuid', branch = '2.0.0' }
 ```
 
 Note that this will actually resolve to two versions of the `uuid` crate. The
@@ -534,3 +535,62 @@ features = ["secure-password", "civet"]
 
 More information about features can be found in the
 [manifest documentation](reference/manifest.html#the-features-section).
+
+### Renaming dependencies in `Cargo.toml`
+
+When writing a `[dependencies]` section in `Cargo.toml` the key you write for a
+dependency typically matches up to the name of the crate you import from in the
+code. For some projects, though, you may wish to reference the crate with a
+different name in the code regardless of how it's published on crates.io. For
+example you may wish to:
+
+* Avoid the need to  `use foo as bar` in Rust source.
+* Depend on multiple versions of a crate.
+* Depend on crates with the same name from different registries.
+
+To support this Cargo supports a `package` key in the `[dependencies]` section
+of which package should be depended on:
+
+```toml
+[package]
+name = "mypackage"
+version = "0.0.1"
+
+[dependencies]
+foo = "0.1"
+bar = { git = "https://github.com/example/project", package = "foo" }
+baz = { version = "0.1", registry = "custom", package = "foo" }
+```
+
+In this example, three crates are now available in your Rust code:
+
+```rust
+extern crate foo; // crates.io
+extern crate bar; // git repository
+extern crate baz; // registry `custom`
+```
+
+All three of these crates have the package name of `foo` in their own
+`Cargo.toml`, so we're explicitly using the `package` key to inform Cargo that
+we want the `foo` package even though we're calling it something else locally.
+The `package` key, if not specified, defaults to the name of the dependency
+being requested.
+
+Note that if you have an optional dependency like:
+
+```toml
+[dependencies]
+foo = { version = "0.1", package = 'bar', optional = true }
+```
+
+you're depending on the crate `bar` from crates.io, but your crate has a `foo`
+feature instead of a `bar` feature. That is, names of features take after the
+name of the dependency, not the package name, when renamed.
+
+Enabling transitive dependencies works similarly, for example we could add the
+following to the above manifest:
+
+```toml
+[features]
+log-debug = ['foo/log-debug'] # using 'bar/log-debug' would be an error!
+```

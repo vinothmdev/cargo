@@ -38,11 +38,13 @@ pub struct CompilationFiles<'a, 'cfg: 'a> {
 
 #[derive(Debug)]
 pub struct OutputFile {
-    /// File name that will be produced by the build process (in `deps`).
+    /// Absolute path to the file that will be produced by the build process.
     pub path: PathBuf,
     /// If it should be linked into `target`, and what it should be called
     /// (e.g. without metadata).
     pub hardlink: Option<PathBuf>,
+    /// If `--out-dir` is specified, the absolute path to the exported file.
+    pub export_path: Option<PathBuf>,
     /// Type of the file (library / debug symbol / else).
     pub flavor: FileFlavor,
 }
@@ -245,16 +247,13 @@ impl<'a, 'cfg: 'a> CompilationFiles<'a, 'cfg> {
         let mut unsupported = Vec::new();
         {
             if unit.mode.is_check() {
-                // This is not quite correct for non-lib targets.  rustc
-                // currently does not emit rmeta files, so there is nothing to
-                // check for!  See #3624.
+                // This may be confusing. rustc outputs a file named `lib*.rmeta`
+                // for both libraries and binaries.
                 let path = out_dir.join(format!("lib{}.rmeta", file_stem));
-                let hardlink = link_stem
-                    .clone()
-                    .map(|(ld, ls)| ld.join(format!("lib{}.rmeta", ls)));
                 ret.push(OutputFile {
                     path,
-                    hardlink,
+                    hardlink: None,
+                    export_path: None,
                     flavor: FileFlavor::Linkable,
                 });
             } else {
@@ -277,9 +276,19 @@ impl<'a, 'cfg: 'a> CompilationFiles<'a, 'cfg> {
                             let hardlink = link_stem
                                 .as_ref()
                                 .map(|&(ref ld, ref ls)| ld.join(file_type.filename(ls)));
+                            let export_path = if unit.target.is_custom_build() {
+                                None
+                            } else {
+                                self.export_dir.as_ref().and_then(|export_dir| {
+                                    hardlink.as_ref().and_then(|hardlink| {
+                                        Some(export_dir.join(hardlink.file_name().unwrap()))
+                                    })
+                                })
+                            };
                             ret.push(OutputFile {
                                 path,
                                 hardlink,
+                                export_path,
                                 flavor: file_type.flavor,
                             });
                         },
@@ -393,6 +402,15 @@ fn compute_metadata<'a, 'cfg>(
 
     let mut hasher = SipHasher::new_with_keys(0, 0);
 
+    // This is a generic version number that can be changed to make
+    // backwards-incompatible changes to any file structures in the output
+    // directory. For example, the fingerprint files or the build-script
+    // output files. Normally cargo updates ship with rustc updates which will
+    // cause a new hash due to the rustc version changing, but this allows
+    // cargo to be extra careful to deal with different versions of cargo that
+    // use the same rustc version.
+    1.hash(&mut hasher);
+
     // Unique metadata per (name, source, version) triple. This'll allow us
     // to pull crates from anywhere w/o worrying about conflicts
     unit.pkg
@@ -427,7 +445,6 @@ fn compute_metadata<'a, 'cfg>(
     // panic=abort and panic=unwind artifacts, additionally with various
     // settings like debuginfo and whatnot.
     unit.profile.hash(&mut hasher);
-    cx.used_in_plugin.contains(unit).hash(&mut hasher);
     unit.mode.hash(&mut hasher);
     if let Some(ref args) = bcx.extra_args_for(unit) {
         args.hash(&mut hasher);

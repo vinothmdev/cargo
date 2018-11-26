@@ -1,8 +1,6 @@
-#![allow(deprecated)] // for SipHasher
-
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::hash::{Hash, Hasher, SipHasher};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -17,7 +15,7 @@ use core::{Dependency, PackageId, PackageIdSpec, SourceId, Summary};
 use core::{Edition, Feature, Features, WorkspaceConfig};
 use util::errors::*;
 use util::toml::TomlManifest;
-use util::{Config, Filesystem};
+use util::{Config, Filesystem, short_hash};
 
 pub enum EitherManifest {
     Real(Manifest),
@@ -183,9 +181,22 @@ impl fmt::Debug for TargetKind {
     }
 }
 
+impl TargetKind {
+    pub fn description(&self) -> &'static str {
+        match self {
+            TargetKind::Lib(..) => "lib",
+            TargetKind::Bin => "bin",
+            TargetKind::Test => "integration-test",
+            TargetKind::ExampleBin | TargetKind::ExampleLib(..) => "example",
+            TargetKind::Bench => "bench",
+            TargetKind::CustomBuild => "build-script",
+        }
+    }
+}
+
 /// Information about a binary, a library, an example, etc. that is part of the
 /// package.
-#[derive(Clone, Hash, PartialEq, Eq)]
+#[derive(Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Target {
     kind: TargetKind,
     name: String,
@@ -204,7 +215,7 @@ pub struct Target {
     edition: Edition,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TargetSourcePath {
     Path(PathBuf),
     Metabuild,
@@ -515,13 +526,11 @@ impl Manifest {
     }
 
     pub fn metabuild_path(&self, target_dir: Filesystem) -> PathBuf {
-        let mut hasher = SipHasher::new_with_keys(0, 0);
-        self.package_id().hash(&mut hasher);
-        let hash = hasher.finish();
+        let hash = short_hash(self.package_id());
         target_dir
             .into_path_unlocked()
             .join(".metabuild")
-            .join(format!("metabuild-{}-{:016x}.rs", self.name(), hash))
+            .join(format!("metabuild-{}-{}.rs", self.name(), hash))
     }
 }
 
@@ -651,7 +660,11 @@ impl Target {
         required_features: Option<Vec<String>>,
         edition: Edition,
     ) -> Target {
-        let kind = if crate_targets.is_empty() {
+        let kind = if crate_targets.is_empty()
+            || crate_targets
+                .iter()
+                .all(|t| *t == LibKind::Other("bin".into()))
+        {
             TargetKind::ExampleBin
         } else {
             TargetKind::ExampleLib(crate_targets)

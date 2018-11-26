@@ -1,9 +1,5 @@
-use std::fs;
-use std::env;
-
+use support::{basic_manifest, project};
 use support::{is_nightly, rustc_host};
-use support::{basic_manifest, execs, project};
-use support::hamcrest::assert_that;
 
 #[test]
 fn plugin_to_the_max() {
@@ -26,8 +22,7 @@ fn plugin_to_the_max() {
             [dependencies.bar]
             path = "../bar"
         "#,
-        )
-        .file(
+        ).file(
             "src/main.rs",
             r#"
             #![feature(plugin)]
@@ -36,8 +31,7 @@ fn plugin_to_the_max() {
 
             fn main() { foo_lib::foo(); }
         "#,
-        )
-        .file(
+        ).file(
             "src/foo_lib.rs",
             r#"
             #![feature(plugin)]
@@ -45,9 +39,9 @@ fn plugin_to_the_max() {
 
             pub fn foo() {}
         "#,
-        )
-        .build();
-    let _bar = project().at("bar")
+        ).build();
+    let _bar = project()
+        .at("bar")
         .file(
             "Cargo.toml",
             r#"
@@ -63,8 +57,7 @@ fn plugin_to_the_max() {
             [dependencies.baz]
             path = "../baz"
         "#,
-        )
-        .file(
+        ).file(
             "src/lib.rs",
             r#"
             #![feature(plugin_registrar, rustc_private)]
@@ -79,9 +72,9 @@ fn plugin_to_the_max() {
                 println!("{}", baz::baz());
             }
         "#,
-        )
-        .build();
-    let _baz = project().at("baz")
+        ).build();
+    let _baz = project()
+        .at("baz")
         .file(
             "Cargo.toml",
             r#"
@@ -94,12 +87,11 @@ fn plugin_to_the_max() {
             name = "baz"
             crate_type = ["dylib"]
         "#,
-        )
-        .file("src/lib.rs", "pub fn baz() -> i32 { 1 }")
+        ).file("src/lib.rs", "pub fn baz() -> i32 { 1 }")
         .build();
 
-    assert_that(foo.cargo("build"), execs());
-    assert_that(foo.cargo("doc"), execs());
+    foo.cargo("build").run();
+    foo.cargo("doc").run();
 }
 
 #[test]
@@ -108,17 +100,8 @@ fn plugin_with_dynamic_native_dependency() {
         return;
     }
 
-    let workspace = project().at("ws")
-        .file(
-            "Cargo.toml",
-            r#"
-            [workspace]
-            members = ["builder", "foo"]
-        "#,
-        )
-        .build();
-
-    let build = project().at("ws/builder")
+    let build = project()
+        .at("builder")
         .file(
             "Cargo.toml",
             r#"
@@ -131,11 +114,10 @@ fn plugin_with_dynamic_native_dependency() {
             name = "builder"
             crate-type = ["dylib"]
         "#,
-        )
-        .file("src/lib.rs", "#[no_mangle] pub extern fn foo() {}")
+        ).file("src/lib.rs", "#[no_mangle] pub extern fn foo() {}")
         .build();
 
-    let foo = project().at("ws/foo")
+    let foo = project()
         .file(
             "Cargo.toml",
             r#"
@@ -147,8 +129,7 @@ fn plugin_with_dynamic_native_dependency() {
             [dependencies.bar]
             path = "bar"
         "#,
-        )
-        .file(
+        ).file(
             "src/main.rs",
             r#"
             #![feature(plugin)]
@@ -156,8 +137,7 @@ fn plugin_with_dynamic_native_dependency() {
 
             fn main() {}
         "#,
-        )
-        .file(
+        ).file(
             "bar/Cargo.toml",
             r#"
             [package]
@@ -170,20 +150,30 @@ fn plugin_with_dynamic_native_dependency() {
             name = "bar"
             plugin = true
         "#,
-        )
-        .file(
+        ).file(
             "bar/build.rs",
             r#"
-            use std::path::PathBuf;
             use std::env;
+            use std::fs;
+            use std::path::PathBuf;
 
             fn main() {
-                let src = PathBuf::from(env::var("SRC").unwrap());
-                println!("cargo:rustc-flags=-L {}/deps", src.parent().unwrap().display());
+                let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+                let root = PathBuf::from(env::var("BUILDER_ROOT").unwrap());
+                let file = format!("{}builder{}",
+                    env::consts::DLL_PREFIX,
+                    env::consts::DLL_SUFFIX);
+                let src = root.join(&file);
+                let dst = out_dir.join(&file);
+                fs::copy(src, dst).unwrap();
+                if cfg!(windows) {
+                    fs::copy(root.join("builder.dll.lib"),
+                             out_dir.join("builder.dll.lib")).unwrap();
+                }
+                println!("cargo:rustc-flags=-L {}", out_dir.display());
             }
         "#,
-        )
-        .file(
+        ).file(
             "bar/src/lib.rs",
             r#"
             #![feature(plugin_registrar, rustc_private)]
@@ -200,25 +190,12 @@ fn plugin_with_dynamic_native_dependency() {
                 unsafe { foo() }
             }
         "#,
-        )
-        .build();
+        ).build();
 
-    assert_that(build.cargo("build"), execs());
+    build.cargo("build").run();
 
-    let src = workspace.root().join("target/debug");
-    let lib = fs::read_dir(&src)
-        .unwrap()
-        .map(|s| s.unwrap().path())
-        .find(|lib| {
-            let lib = lib.file_name().unwrap().to_str().unwrap();
-            lib.starts_with(env::consts::DLL_PREFIX) && lib.ends_with(env::consts::DLL_SUFFIX)
-        })
-        .unwrap();
-
-    assert_that(
-        foo.cargo("build -v").env("SRC", &lib),
-        execs(),
-    );
+    let root = build.root().join("target").join("debug");
+    foo.cargo("build -v").env("BUILDER_ROOT", root).run();
 }
 
 #[test]
@@ -238,13 +215,12 @@ fn plugin_integration() {
             plugin = true
             doctest = false
         "#,
-        )
-        .file("build.rs", "fn main() {}")
+        ).file("build.rs", "fn main() {}")
         .file("src/lib.rs", "")
         .file("tests/it_works.rs", "")
         .build();
 
-    assert_that(p.cargo("test -v"), execs());
+    p.cargo("test -v").run();
 }
 
 #[test]
@@ -261,8 +237,7 @@ fn doctest_a_plugin() {
             [dependencies]
             bar = { path = "bar" }
         "#,
-        )
-        .file("src/lib.rs", "#[macro_use] extern crate bar;")
+        ).file("src/lib.rs", "#[macro_use] extern crate bar;")
         .file(
             "bar/Cargo.toml",
             r#"
@@ -275,11 +250,10 @@ fn doctest_a_plugin() {
             name = "bar"
             plugin = true
         "#,
-        )
-        .file("bar/src/lib.rs", "pub fn bar() {}")
+        ).file("bar/src/lib.rs", "pub fn bar() {}")
         .build();
 
-    assert_that(p.cargo("test -v"), execs());
+    p.cargo("test -v").run();
 }
 
 // See #1515
@@ -299,11 +273,11 @@ fn native_plugin_dependency_with_custom_ar_linker() {
             [lib]
             plugin = true
         "#,
-        )
-        .file("src/lib.rs", "")
+        ).file("src/lib.rs", "")
         .build();
 
-    let bar = project().at("bar")
+    let bar = project()
+        .at("bar")
         .file(
             "Cargo.toml",
             r#"
@@ -315,8 +289,7 @@ fn native_plugin_dependency_with_custom_ar_linker() {
             [dependencies.foo]
             path = "../foo"
         "#,
-        )
-        .file("src/lib.rs", "")
+        ).file("src/lib.rs", "")
         .file(
             ".cargo/config",
             &format!(
@@ -327,19 +300,17 @@ fn native_plugin_dependency_with_custom_ar_linker() {
         "#,
                 target
             ),
-        )
-        .build();
+        ).build();
 
-    assert_that(
-        bar.cargo("build --verbose"),
-        execs().with_status(101).with_stderr_contains(
+    bar.cargo("build --verbose")
+        .with_status(101)
+        .with_stderr_contains(
             "\
 [COMPILING] foo v0.0.1 ([..])
 [RUNNING] `rustc [..] -C ar=nonexistent-ar -C linker=nonexistent-linker [..]`
 [ERROR] [..]linker[..]
 ",
-        ),
-    );
+        ).run();
 }
 
 #[test]
@@ -363,8 +334,7 @@ fn panic_abort_plugins() {
             [dependencies]
             bar = { path = "bar" }
         "#,
-        )
-        .file("src/lib.rs", "")
+        ).file("src/lib.rs", "")
         .file(
             "bar/Cargo.toml",
             r#"
@@ -376,17 +346,15 @@ fn panic_abort_plugins() {
             [lib]
             plugin = true
         "#,
-        )
-        .file(
+        ).file(
             "bar/src/lib.rs",
             r#"
             #![feature(rustc_private)]
             extern crate syntax;
         "#,
-        )
-        .build();
+        ).build();
 
-    assert_that(p.cargo("build"), execs());
+    p.cargo("build").run();
 }
 
 #[test]
@@ -411,8 +379,7 @@ fn shared_panic_abort_plugins() {
             bar = { path = "bar" }
             baz = { path = "baz" }
         "#,
-        )
-        .file("src/lib.rs", "extern crate baz;")
+        ).file("src/lib.rs", "extern crate baz;")
         .file(
             "bar/Cargo.toml",
             r#"
@@ -427,18 +394,16 @@ fn shared_panic_abort_plugins() {
             [dependencies]
             baz = { path = "../baz" }
         "#,
-        )
-        .file(
+        ).file(
             "bar/src/lib.rs",
             r#"
             #![feature(rustc_private)]
             extern crate syntax;
             extern crate baz;
         "#,
-        )
-        .file("baz/Cargo.toml", &basic_manifest("baz", "0.0.1"))
+        ).file("baz/Cargo.toml", &basic_manifest("baz", "0.0.1"))
         .file("baz/src/lib.rs", "")
         .build();
 
-    assert_that(p.cargo("build"), execs());
+    p.cargo("build").run();
 }

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 pub use self::cfg::{Cfg, CfgExpr};
 pub use self::config::{homedir, Config, ConfigValue};
 pub use self::dependency_queue::{DependencyQueue, Dirty, Fresh, Freshness};
@@ -36,6 +38,7 @@ pub mod profile;
 pub mod to_semver;
 pub mod to_url;
 pub mod toml;
+pub mod command_prelude;
 mod cfg;
 mod dependency_queue;
 mod rustc;
@@ -46,3 +49,13 @@ mod read2;
 mod progress;
 mod lockserver;
 pub mod diagnostic_server;
+
+pub fn elapsed(duration: Duration) -> String {
+    let secs = duration.as_secs();
+
+    if secs >= 60 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}.{:02}s", secs, duration.subsec_nanos() / 10_000_000)
+    }
+}

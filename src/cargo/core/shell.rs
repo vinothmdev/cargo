@@ -120,6 +120,13 @@ impl Shell {
         self.err.as_write()
     }
 
+    /// Erase from cursor to end of line.
+    pub fn err_erase_line(&mut self) {
+        if let ShellOut::Stream { tty: true, .. } = self.err {
+            imp::err_erase_line(self);
+        }
+    }
+
     /// Shortcut to right-align and color green a status message.
     pub fn status<T, U>(&mut self, status: T, message: U) -> CargoResult<()>
     where
@@ -332,6 +339,8 @@ mod imp {
 
     use libc;
 
+    use super::Shell;
+
     pub fn stderr_width() -> Option<usize> {
         unsafe {
             let mut winsize: libc::winsize = mem::zeroed();
@@ -345,10 +354,19 @@ mod imp {
             }
         }
     }
+
+    pub fn err_erase_line(shell: &mut Shell) {
+        // This is the "EL - Erase in Line" sequence. It clears from the cursor
+        // to the end of line.
+        // https://en.wikipedia.org/wiki/ANSI_escape_code#CSI_sequences
+        let _ = shell.err().write_all(b"\x1B[K");
+    }
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 mod imp {
+    pub(super) use super::default_err_erase_line as err_erase_line;
+
     pub fn stderr_width() -> Option<usize> {
         None
     }
@@ -358,19 +376,66 @@ mod imp {
 mod imp {
     extern crate winapi;
 
-    use std::mem;
+    use std::{cmp, mem, ptr};
+    use self::winapi::um::fileapi::*;
+    use self::winapi::um::handleapi::*;
     use self::winapi::um::processenv::*;
     use self::winapi::um::winbase::*;
     use self::winapi::um::wincon::*;
+    use self::winapi::um::winnt::*;
+
+    pub(super) use super::default_err_erase_line as err_erase_line;
 
     pub fn stderr_width() -> Option<usize> {
         unsafe {
             let stdout = GetStdHandle(STD_ERROR_HANDLE);
             let mut csbi: CONSOLE_SCREEN_BUFFER_INFO = mem::zeroed();
-            if GetConsoleScreenBufferInfo(stdout, &mut csbi) == 0 {
+            if GetConsoleScreenBufferInfo(stdout, &mut csbi) != 0 {
+                return Some((csbi.srWindow.Right - csbi.srWindow.Left) as usize)
+            }
+
+            // On mintty/msys/cygwin based terminals, the above fails with
+            // INVALID_HANDLE_VALUE. Use an alternate method which works
+            // in that case as well.
+            let h = CreateFileA("CONOUT$\0".as_ptr() as *const CHAR,
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                ptr::null_mut()
+            );
+            if h == INVALID_HANDLE_VALUE {
                 return None;
             }
-            Some((csbi.srWindow.Right - csbi.srWindow.Left) as usize)
+
+            let mut csbi: CONSOLE_SCREEN_BUFFER_INFO = mem::zeroed();
+            let rc = GetConsoleScreenBufferInfo(h, &mut csbi);
+            CloseHandle(h);
+            if rc != 0 {
+                let width = (csbi.srWindow.Right - csbi.srWindow.Left) as usize;
+                // Unfortunately cygwin/mintty does not set the size of the
+                // backing console to match the actual window size. This
+                // always reports a size of 80 or 120 (not sure what
+                // determines that). Use a conservative max of 60 which should
+                // work in most circumstances. ConEmu does some magic to
+                // resize the console correctly, but there's no reasonable way
+                // to detect which kind of terminal we are running in, or if
+                // GetConsoleScreenBufferInfo returns accurate information.
+                return Some(cmp::min(60, width));
+            }
+            return None;
         }
+    }
+}
+
+#[cfg(any(
+    all(unix, not(any(target_os = "linux", target_os = "macos"))),
+    windows,
+))]
+fn default_err_erase_line(shell: &mut Shell) {
+    if let Some(max_width) = imp::stderr_width() {
+        let blank = " ".repeat(max_width);
+        drop(write!(shell.err(), "{}\r", blank));
     }
 }

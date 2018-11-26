@@ -5,16 +5,16 @@ use std::io::{self, Write};
 use std::path::{self, Path, PathBuf};
 use std::sync::Arc;
 
+use failure::Error;
 use same_file::is_same_file;
 use serde_json;
 
 use core::manifest::TargetSourcePath;
 use core::profiles::{Lto, Profile};
-use core::shell::ColorChoice;
 use core::{PackageId, Target};
-use util::errors::{CargoResult, CargoResultExt, Internal};
+use util::errors::{CargoResult, CargoResultExt, Internal, ProcessError};
 use util::paths;
-use util::{self, machine_message, Freshness, ProcessBuilder};
+use util::{self, machine_message, Freshness, ProcessBuilder, process};
 use util::{internal, join_paths, profile};
 
 use self::build_plan::BuildPlan;
@@ -119,7 +119,7 @@ impl Executor for DefaultExecutor {
         _mode: CompileMode,
         state: &job_queue::JobState<'_>,
     ) -> CargoResult<()> {
-        state.capture_output(&cmd, false).map(drop)
+        state.capture_output(&cmd, None, false).map(drop)
     }
 }
 
@@ -129,6 +129,7 @@ fn compile<'a, 'cfg: 'a>(
     plan: &mut BuildPlan,
     unit: &Unit<'a>,
     exec: &Arc<Executor>,
+    force_rebuild: bool,
 ) -> CargoResult<()> {
     let bcx = cx.bcx;
     let build_plan = bcx.build_config.build_plan;
@@ -164,7 +165,7 @@ fn compile<'a, 'cfg: 'a>(
         let dirty = work.then(link_targets(cx, unit, false)?).then(dirty);
         let fresh = link_targets(cx, unit, true)?.then(fresh);
 
-        if exec.force_rebuild(unit) {
+        if exec.force_rebuild(unit) || force_rebuild {
             freshness = Freshness::Dirty;
         }
 
@@ -175,7 +176,7 @@ fn compile<'a, 'cfg: 'a>(
 
     // Be sure to compile all dependencies of this target as well.
     for unit in cx.dep_targets(unit).iter() {
-        compile(cx, jobs, plan, unit, exec)?;
+        compile(cx, jobs, plan, unit, exec, false)?;
     }
     if build_plan {
         plan.add(cx, unit)?;
@@ -240,8 +241,6 @@ fn rustc<'a, 'cfg>(
         .unwrap_or_else(|| cx.bcx.config.cwd())
         .to_path_buf();
 
-    let should_capture_output = cx.bcx.config.cli_unstable().compile_progress;
-
     return Ok(Work::new(move |state| {
         // Only at runtime have we discovered what the extra -L and -l
         // arguments are for native libraries, so we process those here. We
@@ -277,6 +276,19 @@ fn rustc<'a, 'cfg>(
             }
         }
 
+        fn internal_if_simple_exit_code(err: Error) -> Error {
+            // If a signal on unix (code == None) or an abnormal termination
+            // on Windows (codes like 0xC0000409), don't hide the error details.
+            match err
+                .downcast_ref::<ProcessError>()
+                .as_ref()
+                .and_then(|perr| perr.exit.and_then(|e| e.code()))
+            {
+                Some(n) if n < 128 => Internal::new(err).into(),
+                _ => err,
+            }
+        }
+
         state.running(&rustc);
         if json_messages {
             exec.exec_json(
@@ -286,18 +298,14 @@ fn rustc<'a, 'cfg>(
                 mode,
                 &mut assert_is_empty,
                 &mut |line| json_stderr(line, &package_id, &target),
-            ).map_err(Internal::new)
+            )
+            .map_err(internal_if_simple_exit_code)
             .chain_err(|| format!("Could not compile `{}`.", name))?;
         } else if build_plan {
             state.build_plan(buildkey, rustc.clone(), outputs.clone());
         } else {
-            let exec_result = if should_capture_output {
-                exec.exec_and_capture_output(rustc, &package_id, &target, mode, state)
-            } else {
-                exec.exec(rustc, &package_id, &target, mode)
-            };
-            exec_result
-                .map_err(Internal::new)
+            exec.exec_and_capture_output(rustc, &package_id, &target, mode, state)
+                .map_err(internal_if_simple_exit_code)
                 .chain_err(|| format!("Could not compile `{}`.", name))?;
         }
 
@@ -428,12 +436,13 @@ fn link_targets<'a, 'cfg>(
             };
             destinations.push(dst.display().to_string());
             hardlink_or_copy(src, dst)?;
-            if let Some(ref path) = export_dir {
-                if !path.exists() {
-                    fs::create_dir_all(path)?;
+            if let Some(ref path) = output.export_path {
+                let export_dir = export_dir.as_ref().unwrap();
+                if !export_dir.exists() {
+                    fs::create_dir_all(export_dir)?;
                 }
 
-                hardlink_or_copy(src, &path.join(dst.file_name().unwrap()))?;
+                hardlink_or_copy(src, path)?;
             }
         }
 
@@ -590,7 +599,12 @@ fn rustdoc<'a, 'cfg>(cx: &mut Context<'a, 'cfg>, unit: &Unit<'a>) -> CargoResult
     rustdoc.arg("--crate-name").arg(&unit.target.crate_name());
     add_path_args(bcx, unit, &mut rustdoc);
     add_cap_lints(bcx, unit, &mut rustdoc);
-    add_color(bcx, &mut rustdoc);
+
+    let mut can_add_color_process = process(&*bcx.config.rustdoc()?);
+    can_add_color_process.args(&["--color", "never", "-V"]);
+    if bcx.rustc.cached_success(&can_add_color_process)? {
+        add_color(bcx, &mut rustdoc);
+    }
 
     if unit.kind != Kind::Host {
         if let Some(ref target) = bcx.build_config.requested_target {
@@ -628,8 +642,6 @@ fn rustdoc<'a, 'cfg>(cx: &mut Context<'a, 'cfg>, unit: &Unit<'a>) -> CargoResult
     let package_id = unit.pkg.package_id().clone();
     let target = unit.target.clone();
 
-    let should_capture_output = cx.bcx.config.cli_unstable().compile_progress;
-
     Ok(Work::new(move |state| {
         if let Some(output) = build_state.outputs.lock().unwrap().get(&key) {
             for cfg in output.cfgs.iter() {
@@ -648,10 +660,8 @@ fn rustdoc<'a, 'cfg>(cx: &mut Context<'a, 'cfg>, unit: &Unit<'a>) -> CargoResult
                     &mut |line| json_stderr(line, &package_id, &target),
                     false,
                 ).map(drop)
-        } else if should_capture_output {
-            state.capture_output(&rustdoc, false).map(drop)
         } else {
-            rustdoc.exec()
+            state.capture_output(&rustdoc, None, false).map(drop)
         };
         exec_result.chain_err(|| format!("Could not document `{}`.", name))?;
         Ok(())
@@ -664,8 +674,8 @@ fn rustdoc<'a, 'cfg>(cx: &mut Context<'a, 'cfg>, unit: &Unit<'a>) -> CargoResult
 // actually invoke rustc.
 //
 // In general users don't expect `cargo build` to cause rebuilds if you change
-// directories. That could be if you just change directories in the project or
-// if you literally move the whole project wholesale to a new directory. As a
+// directories. That could be if you just change directories in the package or
+// if you literally move the whole package wholesale to a new directory. As a
 // result we mostly don't factor in `cwd` to this calculation. Instead we try to
 // track the workspace as much as possible and we update the current directory
 // of rustc/rustdoc where appropriate.
@@ -708,12 +718,9 @@ fn add_cap_lints(bcx: &BuildContext, unit: &Unit, cmd: &mut ProcessBuilder) {
 }
 
 fn add_color(bcx: &BuildContext, cmd: &mut ProcessBuilder) {
-    let capture_output = bcx.config.cli_unstable().compile_progress;
     let shell = bcx.config.shell();
-    if capture_output || shell.color_choice() != ColorChoice::CargoAuto {
-        let color = if shell.supports_color() { "always" } else { "never" };
-        cmd.args(&["--color", color]);
-    }
+    let color = if shell.supports_color() { "always" } else { "never" };
+    cmd.args(&["--color", color]);
 }
 
 fn add_error_format(bcx: &BuildContext, cmd: &mut ProcessBuilder) {
@@ -774,20 +781,8 @@ fn build_base_args<'a, 'cfg>(
         cmd.arg("-C").arg(&format!("opt-level={}", opt_level));
     }
 
-    // If a panic mode was configured *and* we're not ever going to be used in a
-    // plugin, then we can compile with that panic mode.
-    //
-    // If we're used in a plugin then we'll eventually be linked to libsyntax
-    // most likely which isn't compiled with a custom panic mode, so we'll just
-    // get an error if we actually compile with that. This fixes `panic=abort`
-    // crates which have plugin dependencies, but unfortunately means that
-    // dependencies shared between the main application and plugins must be
-    // compiled without `panic=abort`. This isn't so bad, though, as the main
-    // application will still be compiled with `panic=abort`.
     if let Some(panic) = panic.as_ref() {
-        if !cx.used_in_plugin.contains(unit) {
-            cmd.arg("-C").arg(format!("panic={}", panic));
-        }
+        cmd.arg("-C").arg(format!("panic={}", panic));
     }
 
     // Disable LTO for host builds as prefer_dynamic and it are mutually

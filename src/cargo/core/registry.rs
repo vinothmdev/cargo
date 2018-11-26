@@ -21,6 +21,9 @@ pub trait Registry {
         self.query(dep, &mut |s| ret.push(s), fuzzy)?;
         Ok(ret)
     }
+
+    fn describe_source(&self, source: &SourceId) -> String;
+    fn is_replaced(&self, source: &SourceId) -> bool;
 }
 
 /// This structure represents a registry of known packages. It internally
@@ -37,6 +40,7 @@ pub trait Registry {
 /// a `Source`. Each `Source` in the map has been updated (using network
 /// operations if necessary) and is ready to be queried for packages.
 pub struct PackageRegistry<'cfg> {
+    config: &'cfg Config,
     sources: SourceMap<'cfg>,
 
     // A list of sources which are considered "overrides" which take precedent
@@ -81,6 +85,7 @@ impl<'cfg> PackageRegistry<'cfg> {
     pub fn new(config: &'cfg Config) -> CargoResult<PackageRegistry<'cfg>> {
         let source_config = SourceConfigMap::new(config)?;
         Ok(PackageRegistry {
+            config,
             sources: SourceMap::new(),
             source_ids: HashMap::new(),
             overrides: Vec::new(),
@@ -92,9 +97,9 @@ impl<'cfg> PackageRegistry<'cfg> {
         })
     }
 
-    pub fn get(self, package_ids: &[PackageId]) -> PackageSet<'cfg> {
+    pub fn get(self, package_ids: &[PackageId]) -> CargoResult<PackageSet<'cfg>> {
         trace!("getting packages; sources={}", self.sources.len());
-        PackageSet::new(package_ids, self.sources)
+        PackageSet::new(package_ids, self.sources, self.config)
     }
 
     fn ensure_loaded(&mut self, namespace: &SourceId, kind: Kind) -> CargoResult<()> {
@@ -354,7 +359,7 @@ To change the dependency graph via an override it's recommended to use the
 `[replace]` feature of Cargo instead of the path override feature. This is
 documented online at the url below for more information.
 
-http://doc.crates.io/specifying-dependencies.html#overriding-dependencies
+https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html#overriding-dependencies
 ";
 
         for dep in override_summary.dependencies() {
@@ -525,6 +530,20 @@ impl<'cfg> Registry for PackageRegistry<'cfg> {
         }
         f(self.lock(override_summary));
         Ok(())
+    }
+
+    fn describe_source(&self, id: &SourceId) -> String {
+        match self.sources.get(id) {
+            Some(src) => src.describe(),
+            None => id.to_string(),
+        }
+    }
+
+    fn is_replaced(&self, id: &SourceId) -> bool {
+        match self.sources.get(id) {
+            Some(src) => src.is_replaced(),
+            None => false,
+        }
     }
 }
 

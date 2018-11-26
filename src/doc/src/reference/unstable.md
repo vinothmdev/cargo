@@ -21,14 +21,14 @@ table:
 
 ```toml
 [registries]
-my-registry = { index = "https://my-intranet:8080/index" }
+my-registry = { index = "https://my-intranet:8080/git/index" }
 ```
 
 Authentication information for alternate registries can be added to
 `.cargo/credentials`:
 
 ```toml
-[my-registry]
+[registries.my-registry]
 token = "api-token"
 ```
 
@@ -62,61 +62,6 @@ registries that will restrict publishing only to those registries.
 publish = ["my-registry"]
 ```
 
-
-### rename-dependency
-* Original Issue: [#1311](https://github.com/rust-lang/cargo/issues/1311)
-* PR: [#4953](https://github.com/rust-lang/cargo/pull/4953)
-* Tracking Issue: [#5653](https://github.com/rust-lang/cargo/issues/5653)
-
-The rename-dependency feature allows you to import a dependency
-with a different name from the source.  This can be useful in a few scenarios:
-
-* Depending on crates with the same name from different registries.
-* Depending on multiple versions of a crate.
-* Avoid needing `extern crate foo as bar` in Rust source.
-
-Just include the `package` key to specify the actual name of the dependency.
-You must include `cargo-features` at the top of your `Cargo.toml`.
-
-```toml
-cargo-features = ["rename-dependency"]
-
-[package]
-name = "mypackage"
-version = "0.0.1"
-
-[dependencies]
-foo = "0.1"
-bar = { version = "0.1", registry = "custom", package = "foo" }
-baz = { git = "https://github.com/example/project", package = "foo" }
-```
-
-In this example, three crates are now available in your Rust code:
-
-```rust
-extern crate foo;  // crates.io
-extern crate bar;  // registry `custom`
-extern crate baz;  // git repository
-```
-
-Note that if you have an optional dependency like:
-
-```toml
-[dependencies]
-foo = { version = "0.1", package = 'bar', optional = true }
-```
-
-you're depending on the crate `bar` from crates.io, but your crate has a `foo`
-feature instead of a `bar` feature. That is, names of features take after the
-name of the dependency, not the package name, when renamed.
-
-Enabling transitive dependencies works similarly, for example we could add the
-following to the above manifest:
-
-```toml
-[features]
-log-debug = ['foo/log-debug'] # using 'bar/log-debug' would be an error!
-```
 
 ### publish-lockfile
 * Original Issue: [#2263](https://github.com/rust-lang/cargo/issues/2263)
@@ -196,30 +141,6 @@ directory.  Example:
 
 ```
 cargo +nightly build --out-dir=out -Z unstable-options
-```
-
-
-### Edition
-* Tracking Issue: [rust-lang/rust#44581](https://github.com/rust-lang/rust/issues/44581)
-* RFC: [#2052](https://github.com/rust-lang/rfcs/blob/master/text/2052-epochs.md)
-
-You can opt in to a specific Rust Edition for your package with the `edition`
-key in `Cargo.toml`.  If you don't specify the edition, it will default to
-2015.  You need to include the appropriate `cargo-features`.
-
-You can also specify `edition` on a per-target level, where it will otherwise
-default to the package `edition`.
-
-```toml
-cargo-features = ["edition"]
-
-[package]
-...
-edition = "2018"
-
-[[bin]]
-...
-edition = "2015"
 ```
 
 
@@ -318,31 +239,15 @@ Example:
 cargo +nightly build --build-plan -Z unstable-options
 ```
 
-### Compile progress
-* Tracking Issue: [rust-lang/cargo#2536](https://github.com/rust-lang/cargo/issues/2536)
-
-The `-Z compile-progress` flag enables a progress bar while compiling.
-
-```console
-$ cargo +nightly build -Z compile-progress
-   Compiling libc v0.2.41
-   Compiling void v1.0.2
-   Compiling lazy_static v1.0.1
-   Compiling regex v1.0.0
-   Compiling ucd-util v0.1.1
-   Compiling utf8-ranges v1.0.0
-    Building [=======>                                                  ] 2/14: libc, regex, uc...
-```
-
 ### default-run
 * Original issue: [#2200](https://github.com/rust-lang/cargo/issues/2200)
 
-The `default-run` option in the `[project]` section of the manifest can be used
+The `default-run` option in the `[package]` section of the manifest can be used
 to specify a default binary picked by `cargo run`. For example, when there is
 both `src/bin/a.rs` and `src/bin/b.rs`:
 
 ```toml
-[project]
+[package]
 default-run = "a"
 ```
 

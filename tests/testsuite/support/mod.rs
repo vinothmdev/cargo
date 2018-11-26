@@ -18,22 +18,19 @@ let p = project()
 If you do not specify a `Cargo.toml` manifest using `file()`, one is
 automatically created with a project name of `foo` using `basic_manifest()`.
 
-To run cargo, call the `cargo` method and use the `hamcrest` matchers to check
-the output.
+To run cargo, call the `cargo` method and make assertions on the execution:
 
 ```
-assert_that(
-    p.cargo("run --bin foo"),
-    execs()
-        .with_stderr(
-            "\
+p.cargo("run --bin foo")
+    .with_stderr(
+        "\
 [COMPILING] foo [..]
 [FINISHED] [..]
 [RUNNING] `target/debug/foo`
 ",
-        )
-        .with_stdout("hi!"),
-);
+    )
+    .with_stdout("hi!")
+    .run();
 ```
 
 The project creates a mini sandbox under the "cargo integration test"
@@ -43,10 +40,6 @@ directory.  There is also an empty `home` directory created that will be used
 as a home directory instead of your normal home directory.
 
 See `support::lines_match` for an explanation of the string pattern matching.
-
-See the `hamcrest` module for other matchers like
-`is_not(existing_file(path))`.  This is not the actual hamcrest library, but
-instead a lightweight subset of matchers that are used in cargo tests.
 
 Browse the `pub` functions in the `support` module for a variety of other
 helpful utilities.
@@ -118,17 +111,17 @@ use std::fs;
 use std::io::prelude::*;
 use std::os;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Command, Output};
 use std::str;
-use std::time::Duration;
+use std::time::{self, Duration};
 use std::usize;
 
-use cargo::util::{ProcessBuilder, ProcessError, Rustc};
 use cargo;
+use cargo::util::{CargoResult, ProcessBuilder, ProcessError, Rustc};
+use filetime;
 use serde_json::{self, Value};
 use url::Url;
 
-use self::hamcrest as ham;
 use self::paths::CargoPathExt;
 
 macro_rules! t {
@@ -142,10 +135,11 @@ macro_rules! t {
 
 pub mod cross_compile;
 pub mod git;
-pub mod hamcrest;
 pub mod paths;
 pub mod publish;
 pub mod registry;
+#[macro_use]
+pub mod resolver;
 
 /*
  *
@@ -210,7 +204,7 @@ impl SymlinkBuilder {
 }
 
 pub struct Project {
-    root: PathBuf
+    root: PathBuf,
 }
 
 #[must_use]
@@ -242,7 +236,9 @@ impl ProjectBuilder {
     }
 
     pub fn at<P: AsRef<Path>>(mut self, path: P) -> Self {
-        self.root = Project{root: paths::root().join(path)};
+        self.root = Project {
+            root: paths::root().join(path),
+        };
         self
     }
 
@@ -284,8 +280,19 @@ impl ProjectBuilder {
             self._file(Path::new("Cargo.toml"), &basic_manifest("foo", "0.0.1"))
         }
 
+        let past = time::SystemTime::now() - Duration::new(1, 0);
+        let ftime = filetime::FileTime::from_system_time(past);
+
         for file in self.files.iter() {
             file.mk();
+            if is_coarse_mtime() {
+                // Place the entire project 1 second in the past to ensure
+                // that if cargo is called multiple times, the 2nd call will
+                // see targets as "fresh". Without this, if cargo finishes in
+                // under 1 second, the second call will see the mtime of
+                // source == mtime of output and consider it dirty.
+                filetime::set_file_times(&file.path, ftime, ftime).unwrap();
+            }
         }
 
         for symlink in self.symlinks.iter() {
@@ -368,26 +375,28 @@ impl Project {
         FileBuilder::new(self.root().join(path), body).mk()
     }
 
-    /// Create a `ProcessBuilder` to run a program in the project.
+    /// Create a `ProcessBuilder` to run a program in the project
+    /// and wrap it in an Execs to assert on the execution.
     /// Example:
-    ///         assert_that(
-    ///             p.process(&p.bin("foo")),
-    ///             execs().with_stdout("bar\n"),
-    ///         );
-    pub fn process<T: AsRef<OsStr>>(&self, program: T) -> ProcessBuilder {
+    ///         p.process(&p.bin("foo"))
+    ///             .with_stdout("bar\n")
+    ///             .run();
+    pub fn process<T: AsRef<OsStr>>(&self, program: T) -> Execs {
         let mut p = ::support::process(program);
         p.cwd(self.root());
-        p
+        execs().with_process_builder(p)
     }
 
     /// Create a `ProcessBuilder` to run cargo.
     /// Arguments can be separated by spaces.
     /// Example:
-    ///     assert_that(p.cargo("build --bin foo"), execs());
-    pub fn cargo(&self, cmd: &str) -> ProcessBuilder {
-        let mut p = self.process(&cargo_exe());
-        split_and_add_args(&mut p, cmd);
-        p
+    ///     p.cargo("build --bin foo").run();
+    pub fn cargo(&self, cmd: &str) -> Execs {
+        let mut execs = self.process(&cargo_exe());
+        if let Some(ref mut p) = execs.process_builder {
+            split_and_add_args(p, cmd);
+        }
+        execs
     }
 
     /// Returns the contents of `Cargo.lock`.
@@ -507,24 +516,26 @@ pub fn cargo_dir() -> PathBuf {
                 }
                 path
             })
-        })
-        .unwrap_or_else(|| panic!("CARGO_BIN_PATH wasn't set. Cannot continue running test"))
+        }).unwrap_or_else(|| panic!("CARGO_BIN_PATH wasn't set. Cannot continue running test"))
 }
 
 pub fn cargo_exe() -> PathBuf {
     cargo_dir().join(format!("cargo{}", env::consts::EXE_SUFFIX))
 }
 
-/// Returns an absolute path in the filesystem that `path` points to. The
-/// returned path does not contain any symlinks in its hierarchy.
 /*
  *
  * ===== Matchers =====
  *
  */
 
+pub type MatchResult = Result<(), String>;
+
+#[must_use]
 #[derive(Clone)]
 pub struct Execs {
+    ran: bool,
+    process_builder: Option<ProcessBuilder>,
     expect_stdout: Option<String>,
     expect_stdin: Option<String>,
     expect_stderr: Option<String>,
@@ -542,36 +553,45 @@ pub struct Execs {
 }
 
 impl Execs {
+    pub fn with_process_builder(mut self, p: ProcessBuilder) -> Execs {
+        self.process_builder = Some(p);
+        self
+    }
+
     /// Verify that stdout is equal to the given lines.
     /// See `lines_match` for supported patterns.
-    pub fn with_stdout<S: ToString>(mut self, expected: S) -> Execs {
+    pub fn with_stdout<S: ToString>(&mut self, expected: S) -> &mut Self {
         self.expect_stdout = Some(expected.to_string());
         self
     }
 
     /// Verify that stderr is equal to the given lines.
     /// See `lines_match` for supported patterns.
-    pub fn with_stderr<S: ToString>(mut self, expected: S) -> Execs {
-        self._with_stderr(&expected);
-        self
-    }
-
-    fn _with_stderr(&mut self, expected: &ToString) {
+    pub fn with_stderr<S: ToString>(&mut self, expected: S) -> &mut Self {
         self.expect_stderr = Some(expected.to_string());
+        self
     }
 
     /// Verify the exit code from the process.
     ///
     /// This is not necessary if the expected exit code is `0`.
-    pub fn with_status(mut self, expected: i32) -> Execs {
+    pub fn with_status(&mut self, expected: i32) -> &mut Self {
         self.expect_exit_code = Some(expected);
+        self
+    }
+
+    /// Remove exit code check for the process.
+    ///
+    /// By default, the expected exit code is `0`.
+    pub fn without_status(&mut self) -> &mut Self {
+        self.expect_exit_code = None;
         self
     }
 
     /// Verify that stdout contains the given contiguous lines somewhere in
     /// its output.
     /// See `lines_match` for supported patterns.
-    pub fn with_stdout_contains<S: ToString>(mut self, expected: S) -> Execs {
+    pub fn with_stdout_contains<S: ToString>(&mut self, expected: S) -> &mut Self {
         self.expect_stdout_contains.push(expected.to_string());
         self
     }
@@ -579,7 +599,7 @@ impl Execs {
     /// Verify that stderr contains the given contiguous lines somewhere in
     /// its output.
     /// See `lines_match` for supported patterns.
-    pub fn with_stderr_contains<S: ToString>(mut self, expected: S) -> Execs {
+    pub fn with_stderr_contains<S: ToString>(&mut self, expected: S) -> &mut Self {
         self.expect_stderr_contains.push(expected.to_string());
         self
     }
@@ -587,7 +607,7 @@ impl Execs {
     /// Verify that either stdout or stderr contains the given contiguous
     /// lines somewhere in its output.
     /// See `lines_match` for supported patterns.
-    pub fn with_either_contains<S: ToString>(mut self, expected: S) -> Execs {
+    pub fn with_either_contains<S: ToString>(&mut self, expected: S) -> &mut Self {
         self.expect_either_contains.push(expected.to_string());
         self
     }
@@ -595,7 +615,7 @@ impl Execs {
     /// Verify that stdout contains the given contiguous lines somewhere in
     /// its output, and should be repeated `number` times.
     /// See `lines_match` for supported patterns.
-    pub fn with_stdout_contains_n<S: ToString>(mut self, expected: S, number: usize) -> Execs {
+    pub fn with_stdout_contains_n<S: ToString>(&mut self, expected: S, number: usize) -> &mut Self {
         self.expect_stdout_contains_n
             .push((expected.to_string(), number));
         self
@@ -604,7 +624,7 @@ impl Execs {
     /// Verify that stdout does not contain the given contiguous lines.
     /// See `lines_match` for supported patterns.
     /// See note on `with_stderr_does_not_contain`.
-    pub fn with_stdout_does_not_contain<S: ToString>(mut self, expected: S) -> Execs {
+    pub fn with_stdout_does_not_contain<S: ToString>(&mut self, expected: S) -> &mut Self {
         self.expect_stdout_not_contains.push(expected.to_string());
         self
     }
@@ -617,7 +637,7 @@ impl Execs {
     /// your test will pass without verifying the correct behavior. If
     /// possible, write the test first so that it fails, and then implement
     /// your fix/feature to make it pass.
-    pub fn with_stderr_does_not_contain<S: ToString>(mut self, expected: S) -> Execs {
+    pub fn with_stderr_does_not_contain<S: ToString>(&mut self, expected: S) -> &mut Self {
         self.expect_stderr_not_contains.push(expected.to_string());
         self
     }
@@ -637,7 +657,7 @@ impl Execs {
     ///     [RUNNING] `rustc --crate-name foo [..]
     /// This will randomly fail if the other crate name is `bar`, and the
     /// order changes.
-    pub fn with_stderr_unordered<S: ToString>(mut self, expected: S) -> Execs {
+    pub fn with_stderr_unordered<S: ToString>(&mut self, expected: S) -> &mut Self {
         self.expect_stderr_unordered.push(expected.to_string());
         self
     }
@@ -658,7 +678,7 @@ impl Execs {
     /// The order of arrays is ignored.
     /// Strings support patterns described in `lines_match`.
     /// Use `{...}` to match any object.
-    pub fn with_json(mut self, expected: &str) -> Execs {
+    pub fn with_json(&mut self, expected: &str) -> &mut Self {
         self.expect_json = Some(
             expected
                 .split("\n\n")
@@ -672,18 +692,117 @@ impl Execs {
     /// Useful for printf debugging of the tests.
     /// CAUTION: CI will fail if you leave this in your test!
     #[allow(unused)]
-    pub fn stream(mut self) -> Execs {
+    pub fn stream(&mut self) -> &mut Self {
         self.stream_output = true;
         self
     }
 
-    fn match_output(&self, actual: &Output) -> ham::MatchResult {
+    pub fn arg<T: AsRef<OsStr>>(&mut self, arg: T) -> &mut Self {
+        if let Some(ref mut p) = self.process_builder {
+            p.arg(arg);
+        }
+        self
+    }
+
+    pub fn cwd<T: AsRef<OsStr>>(&mut self, path: T) -> &mut Self {
+        if let Some(ref mut p) = self.process_builder {
+            p.cwd(path);
+        }
+        self
+    }
+
+    pub fn env<T: AsRef<OsStr>>(&mut self, key: &str, val: T) -> &mut Self {
+        if let Some(ref mut p) = self.process_builder {
+            p.env(key, val);
+        }
+        self
+    }
+
+    pub fn env_remove(&mut self, key: &str) -> &mut Self {
+        if let Some(ref mut p) = self.process_builder {
+            p.env_remove(key);
+        }
+        self
+    }
+
+    pub fn exec_with_output(&mut self) -> CargoResult<Output> {
+        self.ran = true;
+        // TODO avoid unwrap
+        let p = (&self.process_builder).clone().unwrap();
+        p.exec_with_output()
+    }
+
+    pub fn build_command(&mut self) -> Command {
+        self.ran = true;
+        // TODO avoid unwrap
+        let p = (&self.process_builder).clone().unwrap();
+        p.build_command()
+    }
+
+    pub fn masquerade_as_nightly_cargo(&mut self) -> &mut Self {
+        if let Some(ref mut p) = self.process_builder {
+            p.masquerade_as_nightly_cargo();
+        }
+        self
+    }
+
+    pub fn run(&mut self) {
+        self.ran = true;
+        let p = (&self.process_builder).clone().unwrap();
+        if let Err(e) = self.match_process(&p) {
+            panic!("\nExpected: {:?}\n    but: {}", self, e)
+        }
+    }
+
+    pub fn run_output(&mut self, output: &Output) {
+        self.ran = true;
+        if let Err(e) = self.match_output(output) {
+            panic!("\nExpected: {:?}\n    but: {}", self, e)
+        }
+    }
+
+    fn match_process(&self, process: &ProcessBuilder) -> MatchResult {
+        println!("running {}", process);
+        let res = if self.stream_output {
+            if env::var("CI").is_ok() {
+                panic!("`.stream()` is for local debugging")
+            }
+            process.exec_with_streaming(
+                &mut |out| Ok(println!("{}", out)),
+                &mut |err| Ok(eprintln!("{}", err)),
+                true,
+            )
+        } else {
+            process.exec_with_output()
+        };
+
+        match res {
+            Ok(out) => self.match_output(&out),
+            Err(e) => {
+                let err = e.downcast_ref::<ProcessError>();
+                if let Some(&ProcessError {
+                    output: Some(ref out),
+                    ..
+                }) = err
+                {
+                    return self.match_output(out);
+                }
+                let mut s = format!("could not exec process {}: {}", process, e);
+                for cause in e.iter_causes() {
+                    s.push_str(&format!("\ncaused by: {}", cause));
+                }
+                Err(s)
+            }
+        }
+    }
+
+    fn match_output(&self, actual: &Output) -> MatchResult {
         self.match_status(actual)
             .and(self.match_stdout(actual))
             .and(self.match_stderr(actual))
     }
 
-    fn match_status(&self, actual: &Output) -> ham::MatchResult {
+    fn match_status(&self, actual: &Output) -> MatchResult {
         match self.expect_exit_code {
             None => Ok(()),
             Some(code) if actual.status.code() == Some(code) => Ok(()),
@@ -696,7 +815,7 @@ impl Execs {
         }
     }
 
-    fn match_stdout(&self, actual: &Output) -> ham::MatchResult {
+    fn match_stdout(&self, actual: &Output) -> MatchResult {
         self.match_std(
             self.expect_stdout.as_ref(),
             &actual.stdout,
@@ -824,7 +943,7 @@ impl Execs {
         Ok(())
     }
 
-    fn match_stderr(&self, actual: &Output) -> ham::MatchResult {
+    fn match_stderr(&self, actual: &Output) -> MatchResult {
         self.match_std(
             self.expect_stderr.as_ref(),
             &actual.stderr,
@@ -841,11 +960,31 @@ impl Execs {
         description: &str,
         extra: &[u8],
         kind: MatchKind,
-    ) -> ham::MatchResult {
+    ) -> MatchResult {
         let out = match expected {
-            Some(out) => out,
+            Some(out) => {
+                // Do the template replacements on the expected string.
+                let replaced = match self.process_builder {
+                    None => out.to_string(),
+                    Some(ref p) => match p.get_cwd() {
+                        None => out.to_string(),
+                        Some(cwd) => out
+                            .replace( "[CWD]", &cwd.display().to_string())
+                        ,
+                    },
+                };
+
+                // On Windows, we need to use a wildcard for the drive,
+                // because we don't actually know what it will be.
+                let replaced = replaced
+                    .replace("[ROOT]",
+                             if cfg!(windows) { r#"[..]:\"# } else { "/" });
+
+                replaced
+            },
             None => return Ok(()),
         };
+
         let actual = match str::from_utf8(actual) {
             Err(..) => return Err(format!("{} was not utf8 encoded", description)),
             Ok(actual) => actual,
@@ -976,7 +1115,7 @@ impl Execs {
         }
     }
 
-    fn match_json(&self, expected: &Value, line: &str) -> ham::MatchResult {
+    fn match_json(&self, expected: &Value, line: &str) -> MatchResult {
         let actual = match line.parse() {
             Err(e) => return Err(format!("invalid json, {}:\n`{}`", e, line)),
             Ok(actual) => actual,
@@ -1018,8 +1157,15 @@ impl Execs {
                 (Some(a), None) => Some(format!("{:3} -\n    + |{}|\n", i, a)),
                 (None, Some(e)) => Some(format!("{:3} - |{}|\n    +\n", i, e)),
                 (None, None) => panic!("Cannot get here"),
-            })
-            .collect()
+            }).collect()
+    }
+}
+
+impl Drop for Execs {
+    fn drop(&mut self) {
+        if !self.ran {
+            panic!("forgot to run this command");
+        }
     }
 }
 
@@ -1042,8 +1188,10 @@ enum MatchKind {
 ///   See `substitute_macros` for a complete list of macros.
 pub fn lines_match(expected: &str, actual: &str) -> bool {
     // Let's not deal with / vs \ (windows...)
-    let expected = expected.replace("\\", "/");
-    let mut actual: &str = &actual.replace("\\", "/");
+    // First replace backslash-escaped backslashes with forward slashes
+    // which can occur in, for example, JSON output
+    let expected = expected.replace("\\\\", "/").replace("\\", "/");
+    let mut actual: &str = &actual.replace("\\\\", "/").replace("\\", "/");
     let expected = substitute_macros(&expected);
     for (i, part) in expected.split("[..]").enumerate() {
         match actual.find(part) {
@@ -1158,57 +1306,10 @@ impl fmt::Debug for Execs {
     }
 }
 
-impl ham::Matcher<ProcessBuilder> for Execs {
-    fn matches(&self, mut process: ProcessBuilder) -> ham::MatchResult {
-        self.matches(&mut process)
-    }
-}
-
-impl<'a> ham::Matcher<&'a mut ProcessBuilder> for Execs {
-    fn matches(&self, process: &'a mut ProcessBuilder) -> ham::MatchResult {
-        println!("running {}", process);
-        let res = if self.stream_output {
-            if env::var("CI").is_ok() {
-                panic!("`.stream()` is for local debugging")
-            }
-            process.exec_with_streaming(
-                &mut |out| Ok(println!("{}", out)),
-                &mut |err| Ok(eprintln!("{}", err)),
-                false,
-            )
-        } else {
-            process.exec_with_output()
-        };
-
-        match res {
-            Ok(out) => self.match_output(&out),
-            Err(e) => {
-                let err = e.downcast_ref::<ProcessError>();
-                if let Some(&ProcessError {
-                    output: Some(ref out),
-                    ..
-                }) = err
-                    {
-                        return self.match_output(out);
-                    }
-                let mut s = format!("could not exec process {}: {}", process, e);
-                for cause in e.iter_causes() {
-                    s.push_str(&format!("\ncaused by: {}", cause));
-                }
-                Err(s)
-            }
-        }
-    }
-}
-
-impl ham::Matcher<Output> for Execs {
-    fn matches(&self, output: Output) -> ham::MatchResult {
-        self.match_output(&output)
-    }
-}
-
 pub fn execs() -> Execs {
     Execs {
+        ran: false,
+        process_builder: None,
         expect_stdout: None,
         expect_stderr: None,
         expect_stdin: None,
@@ -1304,6 +1405,7 @@ fn substitute_macros(input: &str) -> String {
         ("[DOCTEST]", "   Doc-tests"),
         ("[PACKAGING]", "   Packaging"),
         ("[DOWNLOADING]", " Downloading"),
+        ("[DOWNLOADED]", "  Downloaded"),
         ("[UPLOADING]", "   Uploading"),
         ("[VERIFYING]", "   Verifying"),
         ("[ARCHIVING]", "   Archiving"),
@@ -1407,10 +1509,10 @@ fn split_and_add_args(p: &mut ProcessBuilder, s: &str) {
     }
 }
 
-pub fn cargo_process(s: &str) -> ProcessBuilder {
+pub fn cargo_process(s: &str) -> Execs {
     let mut p = process(&cargo_exe());
     split_and_add_args(&mut p, s);
-    p
+    execs().with_process_builder(p)
 }
 
 pub fn git_process(s: &str) -> ProcessBuilder {
@@ -1421,4 +1523,12 @@ pub fn git_process(s: &str) -> ProcessBuilder {
 
 pub fn sleep_ms(ms: u64) {
     ::std::thread::sleep(Duration::from_millis(ms));
+}
+
+/// Returns true if the local filesystem has low-resolution mtimes.
+pub fn is_coarse_mtime() -> bool {
+    // This should actually be a test that $CARGO_TARGET_DIR is on an HFS
+    // filesystem, (or any filesystem with low-resolution mtimes). However,
+    // that's tricky to detect, so for now just deal with CI.
+    cfg!(target_os = "macos") && env::var("CI").is_ok()
 }

@@ -4,8 +4,8 @@ use clap::{AppSettings, Arg, ArgMatches};
 
 use cargo::{self, CliResult, Config};
 
+use super::commands::{self, BuiltinExec};
 use super::list_commands;
-use super::commands;
 use command_prelude::*;
 
 pub fn main(config: &mut Config) -> CliResult {
@@ -34,7 +34,6 @@ Available unstable (nightly-only) flags:
     -Z offline          -- Offline mode that does not perform network requests
     -Z unstable-options -- Allow the usage of unstable options such as --registry
     -Z config-profile   -- Read profiles from .cargo/config files
-    -Z compile-progress -- Display a progress bar while compiling
 
 Run with 'cargo -Z [FLAG] [SUBCOMMAND]'"
         );
@@ -43,20 +42,8 @@ Run with 'cargo -Z [FLAG] [SUBCOMMAND]'"
 
     let is_verbose = args.occurrences_of("verbose") > 0;
     if args.is_present("version") {
-        let version = cargo::version();
-        println!("{}", version);
-        if is_verbose {
-            println!(
-                "release: {}.{}.{}",
-                version.major, version.minor, version.patch
-            );
-            if let Some(ref cfg) = version.cfg_info {
-                if let Some(ref ci) = cfg.commit_info {
-                    println!("commit-hash: {}", ci.commit_hash);
-                    println!("commit-date: {}", ci.commit_date);
-                }
-            }
-        }
+        let version = get_version_string(is_verbose);
+        print!("{}", version);
         return Ok(());
     }
 
@@ -92,6 +79,25 @@ Run with 'cargo -Z [FLAG] [SUBCOMMAND]'"
     execute_subcommand(config, &args)
 }
 
+pub fn get_version_string(is_verbose: bool) -> String {
+    let version = cargo::version();
+    let mut version_string = String::from(version.to_string());
+    version_string.push_str("\n");
+    if is_verbose {
+        version_string.push_str(&format!(
+            "release: {}.{}.{}\n",
+            version.major, version.minor, version.patch
+        ));
+        if let Some(ref cfg) = version.cfg_info {
+            if let Some(ref ci) = cfg.commit_info {
+                version_string.push_str(&format!("commit-hash: {}\n", ci.commit_hash));
+                version_string.push_str(&format!("commit-date: {}\n", ci.commit_date));
+            }
+        }
+    }
+    version_string
+}
+
 fn expand_aliases(
     config: &mut Config,
     args: ArgMatches<'static>,
@@ -101,26 +107,34 @@ fn expand_aliases(
             commands::builtin_exec(cmd),
             super::aliased_command(config, cmd)?,
         ) {
-            (None, Some(mut alias)) => {
-                alias.extend(
+            (
+                Some(BuiltinExec {
+                    alias_for: None, ..
+                }),
+                Some(_),
+            ) => {
+                // User alias conflicts with a built-in subcommand
+                config.shell().warn(format!(
+                    "user-defined alias `{}` is ignored, because it is shadowed by a built-in command",
+                    cmd,
+                ))?;
+            }
+            (_, Some(mut user_alias)) => {
+                // User alias takes precedence over built-in aliases
+                user_alias.extend(
                     args.values_of("")
                         .unwrap_or_default()
                         .map(|s| s.to_string()),
                 );
                 let args = cli()
                     .setting(AppSettings::NoBinaryName)
-                    .get_matches_from_safe(alias)?;
+                    .get_matches_from_safe(user_alias)?;
                 return expand_aliases(config, args);
-            }
-            (Some(_), Some(_)) => {
-                config.shell().warn(format!(
-                    "alias `{}` is ignored, because it is shadowed by a built in command",
-                    cmd
-                ))?;
             }
             (_, None) => {}
         }
     };
+
     Ok(args)
 }
 
@@ -146,11 +160,12 @@ fn execute_subcommand(config: &mut Config, args: &ArgMatches) -> CliResult {
         args.is_present("frozen"),
         args.is_present("locked"),
         arg_target_dir,
-        &args.values_of_lossy("unstable-features")
+        &args
+            .values_of_lossy("unstable-features")
             .unwrap_or_default(),
     )?;
 
-    if let Some(exec) = commands::builtin_exec(cmd) {
+    if let Some(BuiltinExec { exec, .. }) = commands::builtin_exec(cmd) {
         return exec(config, subcommand_args);
     }
 
@@ -179,18 +194,18 @@ OPTIONS:
 {unified}
 
 Some common cargo commands are (see all commands with --list):
-    build       Compile the current project
-    check       Analyze the current project and report errors, but don't build object files
+    build       Compile the current package
+    check       Analyze the current package and report errors, but don't build object files
     clean       Remove the target directory
-    doc         Build this project's and its dependencies' documentation
-    new         Create a new cargo project
-    init        Create a new cargo project in an existing directory
+    doc         Build this package's and its dependencies' documentation
+    new         Create a new cargo package
+    init        Create a new cargo package in an existing directory
     run         Build and execute src/main.rs
     test        Run the tests
     bench       Run the benchmarks
     update      Update dependencies listed in Cargo.lock
     search      Search registry for crates
-    publish     Package and upload this project to the registry
+    publish     Package and upload this package to the registry
     install     Install a Rust binary
     uninstall   Uninstall a Rust binary
 

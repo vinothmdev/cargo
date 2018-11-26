@@ -4,15 +4,15 @@ use std::io::prelude::*;
 use std::path::{Path, PathBuf};
 
 use cargo::util::Sha256;
-use flate2::Compression;
 use flate2::write::GzEncoder;
+use flate2::Compression;
 use git2;
 use hex;
 use tar::{Builder, Header};
 use url::Url;
 
-use support::paths;
 use support::git::repo;
+use support::paths;
 
 pub fn registry_path() -> PathBuf {
     paths::root().join("registry")
@@ -109,9 +109,7 @@ pub fn alt_api_url() -> Url {
 ///     "#)
 ///     .build();
 ///
-/// assert_that(
-///     p.cargo("run"),
-///     execs().with_stdout("24"));
+/// p.cargo("run").with_stdout("24").run();
 /// ```
 pub struct Package {
     name: String,
@@ -125,13 +123,16 @@ pub struct Package {
     alternative: bool,
 }
 
-struct Dependency {
+#[derive(Clone)]
+pub struct Dependency {
     name: String,
     vers: String,
     kind: String,
     target: Option<String>,
     features: Vec<String>,
     registry: Option<String>,
+    package: Option<String>,
+    optional: bool,
 }
 
 pub fn init() {
@@ -171,8 +172,7 @@ pub fn init() {
         "#,
                 dl_url()
             ),
-        )
-        .build();
+        ).build();
     fs::create_dir_all(dl_path().join("api/v1/crates")).unwrap();
 
     // Init an alt registry
@@ -186,8 +186,7 @@ pub fn init() {
                 alt_dl_url(),
                 alt_api_url()
             ),
-        )
-        .build();
+        ).build();
     fs::create_dir_all(alt_api_path().join("api/v1/crates")).unwrap();
 }
 
@@ -254,7 +253,7 @@ impl Package {
     /// foo = {version = "1.0"}
     /// ```
     pub fn dep(&mut self, name: &str, vers: &str) -> &mut Package {
-        self.full_dep(name, vers, None, "normal", &[], None)
+        self.add_dep(&Dependency::new(name, vers))
     }
 
     /// Add a dependency with the given feature. Example:
@@ -263,7 +262,7 @@ impl Package {
     /// foo = {version = "1.0", "features": ["feat1", "feat2"]}
     /// ```
     pub fn feature_dep(&mut self, name: &str, vers: &str, features: &[&str]) -> &mut Package {
-        self.full_dep(name, vers, None, "normal", features, None)
+        self.add_dep(Dependency::new(name, vers).enable_features(features))
     }
 
     /// Add a platform-specific dependency. Example:
@@ -272,13 +271,13 @@ impl Package {
     /// foo = {version = "1.0"}
     /// ```
     pub fn target_dep(&mut self, name: &str, vers: &str, target: &str) -> &mut Package {
-        self.full_dep(name, vers, Some(target), "normal", &[], None)
+        self.add_dep(Dependency::new(name, vers).target(target))
     }
 
     /// Add a dependency to an alternative registry.
     /// The given registry should be a URI to the alternative registry.
     pub fn registry_dep(&mut self, name: &str, vers: &str, registry: &str) -> &mut Package {
-        self.full_dep(name, vers, None, "normal", &[], Some(registry))
+        self.add_dep(Dependency::new(name, vers).registry(registry))
     }
 
     /// Add a dev-dependency. Example:
@@ -287,7 +286,7 @@ impl Package {
     /// foo = {version = "1.0"}
     /// ```
     pub fn dev_dep(&mut self, name: &str, vers: &str) -> &mut Package {
-        self.full_dep(name, vers, None, "dev", &[], None)
+        self.add_dep(Dependency::new(name, vers).dev())
     }
 
     /// Add a build-dependency. Example:
@@ -296,32 +295,24 @@ impl Package {
     /// foo = {version = "1.0"}
     /// ```
     pub fn build_dep(&mut self, name: &str, vers: &str) -> &mut Package {
-        self.full_dep(name, vers, None, "build", &[], None)
+        self.add_dep(Dependency::new(name, vers).build())
     }
 
-    fn full_dep(
-        &mut self,
-        name: &str,
-        vers: &str,
-        target: Option<&str>,
-        kind: &str,
-        features: &[&str],
-        registry: Option<&str>,
-    ) -> &mut Package {
-        self.deps.push(Dependency {
-            name: name.to_string(),
-            vers: vers.to_string(),
-            kind: kind.to_string(),
-            target: target.map(|s| s.to_string()),
-            features: features.iter().map(|s| s.to_string()).collect(),
-            registry: registry.map(|s| s.to_string()),
-        });
+    pub fn add_dep(&mut self, dep: &Dependency) -> &mut Package {
+        self.deps.push(dep.clone());
         self
     }
 
     /// Specify whether or not the package is "yanked".
     pub fn yanked(&mut self, yanked: bool) -> &mut Package {
         self.yanked = yanked;
+        self
+    }
+
+    /// Add an entry in the `[features]` section
+    pub fn feature(&mut self, name: &str, deps: &[&str]) -> &mut Package {
+        let deps = deps.iter().map(|s| s.to_string()).collect();
+        self.features.insert(name.to_string(), deps);
         self
     }
 
@@ -335,21 +326,22 @@ impl Package {
         self.make_archive();
 
         // Figure out what we're going to write into the index
-        let deps = self.deps
+        let deps = self
+            .deps
             .iter()
             .map(|dep| {
                 json!({
-                "name": dep.name,
-                "req": dep.vers,
-                "features": dep.features,
-                "default_features": true,
-                "target": dep.target,
-                "optional": false,
-                "kind": dep.kind,
-                "registry": dep.registry,
-            })
-            })
-            .collect::<Vec<_>>();
+                    "name": dep.name,
+                    "req": dep.vers,
+                    "features": dep.features,
+                    "default_features": true,
+                    "target": dep.target,
+                    "optional": dep.optional,
+                    "kind": dep.kind,
+                    "registry": dep.registry,
+                    "package": dep.package,
+                })
+            }).collect::<Vec<_>>();
         let cksum = {
             let mut c = Vec::new();
             t!(t!(File::open(&self.archive_dst())).read_to_end(&mut c));
@@ -495,4 +487,61 @@ pub fn cksum(s: &[u8]) -> String {
     let mut sha = Sha256::new();
     sha.update(s);
     hex::encode(&sha.finish())
+}
+
+impl Dependency {
+    pub fn new(name: &str, vers: &str) -> Dependency {
+        Dependency {
+            name: name.to_string(),
+            vers: vers.to_string(),
+            kind: "normal".to_string(),
+            target: None,
+            features: Vec::new(),
+            package: None,
+            optional: false,
+            registry: None,
+        }
+    }
+
+    /// Change this to `[build-dependencies]`
+    pub fn build(&mut self) -> &mut Self {
+        self.kind = "build".to_string();
+        self
+    }
+
+    /// Change this to `[dev-dependencies]`
+    pub fn dev(&mut self) -> &mut Self {
+        self.kind = "dev".to_string();
+        self
+    }
+
+    /// Change this to `[target.$target.dependencies]`
+    pub fn target(&mut self, target: &str) -> &mut Self {
+        self.target = Some(target.to_string());
+        self
+    }
+
+    /// Add `registry = $registry` to this dependency
+    pub fn registry(&mut self, registry: &str) -> &mut Self {
+        self.registry = Some(registry.to_string());
+        self
+    }
+
+    /// Add `features = [ ... ]` to this dependency
+    pub fn enable_features(&mut self, features: &[&str]) -> &mut Self {
+        self.features.extend(features.iter().map(|s| s.to_string()));
+        self
+    }
+
+    /// Add `package = ...` to this dependency
+    pub fn package(&mut self, pkg: &str) -> &mut Self {
+        self.package = Some(pkg.to_string());
+        self
+    }
+
+    /// Change this to an optional dependency
+    pub fn optional(&mut self, optional: bool) -> &mut Self {
+        self.optional = optional;
+        self
+    }
 }

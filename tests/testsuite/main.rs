@@ -9,7 +9,11 @@ extern crate flate2;
 extern crate git2;
 extern crate glob;
 extern crate hex;
+#[macro_use]
+extern crate lazy_static;
 extern crate libc;
+#[macro_use]
+extern crate proptest;
 #[macro_use]
 extern crate serde_derive;
 #[macro_use]
@@ -27,18 +31,19 @@ mod alt_registry;
 mod bad_config;
 mod bad_manifest_path;
 mod bench;
+mod build;
 mod build_auth;
 mod build_lib;
-mod build;
 mod build_plan;
-mod build_script_env;
 mod build_script;
+mod build_script_env;
 mod cargo_alias_config;
-mod cargo_features;
 mod cargo_command;
+mod cargo_features;
 mod cfg;
 mod check;
 mod clean;
+mod collisions;
 mod concurrent;
 mod config;
 mod corrupt_git;
@@ -62,6 +67,7 @@ mod jobserver;
 mod local_registry;
 mod lockfile_compat;
 mod login;
+mod member_errors;
 mod metabuild;
 mod metadata;
 mod net_config;
@@ -73,10 +79,10 @@ mod patch;
 mod path;
 mod plugins;
 mod proc_macro;
-mod profiles;
 mod profile_config;
 mod profile_overrides;
 mod profile_targets;
+mod profiles;
 mod publish;
 mod read_manifest;
 mod registry;
@@ -86,8 +92,8 @@ mod resolve;
 mod run;
 mod rustc;
 mod rustc_info_cache;
-mod rustdocflags;
 mod rustdoc;
+mod rustdocflags;
 mod rustflags;
 mod search;
 mod shell_quoting;
@@ -99,3 +105,9 @@ mod verify_project;
 mod version;
 mod warn_on_failure;
 mod workspaces;
+
+#[test]
+fn aaa_trigger_cross_compile_disabled_check() {
+    // This triggers the cross compile disabled check to run ASAP, see #5141
+    support::cross_compile::disabled();
+}

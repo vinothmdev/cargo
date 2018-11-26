@@ -33,6 +33,7 @@ pub struct FixOptions<'a> {
     pub compile_opts: CompileOptions<'a>,
     pub allow_dirty: bool,
     pub allow_no_vcs: bool,
+    pub allow_staged: bool,
     pub broken_code: bool,
 }
 
@@ -47,6 +48,8 @@ pub fn fix(ws: &Workspace, opts: &mut FixOptions) -> CargoResult<()> {
         lock_server.addr().to_string(),
     ));
     let _started = lock_server.start()?;
+
+    opts.compile_opts.build_config.force_rebuild = true;
 
     if opts.broken_code {
         let key = BROKEN_CODE_ENV.to_string();
@@ -82,30 +85,43 @@ fn check_version_control(opts: &FixOptions) -> CargoResult<()> {
     }
     let config = opts.compile_opts.config;
     if !existing_vcs_repo(config.cwd(), config.cwd()) {
-        bail!("no VCS found for this project and `cargo fix` can potentially \
+        bail!("no VCS found for this package and `cargo fix` can potentially \
                perform destructive changes; if you'd like to suppress this \
                error pass `--allow-no-vcs`")
     }
 
-    if opts.allow_dirty {
+    if opts.allow_dirty && opts.allow_staged {
         return Ok(())
     }
 
     let mut dirty_files = Vec::new();
+    let mut staged_files = Vec::new();
     if let Ok(repo) = git2::Repository::discover(config.cwd()) {
-        let mut opts = git2::StatusOptions::new();
-        opts.include_ignored(false);
-        for status in repo.statuses(Some(&mut opts))?.iter() {
-            if status.status() != git2::Status::CURRENT {
-                if let Some(path) = status.path() {
-                    dirty_files.push(path.to_string());
-                }
+        let mut repo_opts = git2::StatusOptions::new();
+        repo_opts.include_ignored(false);
+        for status in repo.statuses(Some(&mut repo_opts))?.iter() {
+            if let Some(path) = status.path() {
+                match status.status() {
+                    git2::Status::CURRENT => (),
+                    git2::Status::INDEX_NEW |
+                    git2::Status::INDEX_MODIFIED |
+                    git2::Status::INDEX_DELETED |
+                    git2::Status::INDEX_RENAMED |
+                    git2::Status::INDEX_TYPECHANGE =>
+                        if !opts.allow_staged {
+                            staged_files.push(path.to_string())
+                        },
+                    _ =>
+                        if !opts.allow_dirty {
+                            dirty_files.push(path.to_string())
+                        },
+                };
             }
 
         }
     }
 
-    if dirty_files.is_empty() {
+    if dirty_files.is_empty() && staged_files.is_empty() {
         return Ok(())
     }
 
@@ -113,13 +129,18 @@ fn check_version_control(opts: &FixOptions) -> CargoResult<()> {
     for file in dirty_files {
         files_list.push_str("  * ");
         files_list.push_str(&file);
-        files_list.push_str("\n");
+        files_list.push_str(" (dirty)\n");
+    }
+    for file in staged_files {
+        files_list.push_str("  * ");
+        files_list.push_str(&file);
+        files_list.push_str(" (staged)\n");
     }
 
-    bail!("the working directory of this project is detected as dirty, and \
+    bail!("the working directory of this package has uncommitted changes, and \
            `cargo fix` can potentially perform destructive changes; if you'd \
-           like to suppress this error pass `--allow-dirty`, or commit the \
-           changes to these files:\n\
+           like to suppress this error pass `--allow-dirty`, `--allow-staged`, \
+           or commit the changes to these files:\n\
            \n\
            {}\n\
           ", files_list);
@@ -144,7 +165,7 @@ pub fn fix_maybe_exec_rustc() -> CargoResult<bool> {
     // not the best heuristic but matches what Cargo does today at least.
     let mut fixes = FixedCrate::default();
     if let Some(path) = &args.file {
-        if env::var("CARGO_PRIMARY_PACKAGE").is_ok() {
+        if args.primary_package {
             trace!("start rustfixing {:?}", path);
             fixes = rustfix_crate(&lock_addr, rustc.as_ref(), path, &args)?;
         }
@@ -184,9 +205,11 @@ pub fn fix_maybe_exec_rustc() -> CargoResult<bool> {
         // user's code with our changes. Back out everything and fall through
         // below to recompile again.
         if !output.status.success() {
-            for (path, file) in fixes.files.iter() {
-                fs::write(path, &file.original_code)
-                    .with_context(|_| format!("failed to write file `{}`", path))?;
+            if env::var_os(BROKEN_CODE_ENV).is_none() {
+                for (path, file) in fixes.files.iter() {
+                    fs::write(path, &file.original_code)
+                        .with_context(|_| format!("failed to write file `{}`", path))?;
+                }
             }
             log_failed_fix(&output.stderr)?;
         }
@@ -212,7 +235,6 @@ fn rustfix_crate(lock_addr: &str, rustc: &Path, filename: &Path, args: &FixArgs)
     -> Result<FixedCrate, Error>
 {
     args.verify_not_preparing_for_enabled_edition()?;
-    args.warn_if_preparing_probably_inert()?;
 
     // First up we want to make sure that each crate is only checked by one
     // process at a time. If two invocations concurrently check a crate then
@@ -483,6 +505,7 @@ struct FixArgs {
     idioms: bool,
     enabled_edition: Option<String>,
     other: Vec<OsString>,
+    primary_package: bool,
 }
 
 enum PrepareFor {
@@ -523,6 +546,7 @@ impl FixArgs {
             ret.prepare_for_edition = PrepareFor::Next;
         }
         ret.idioms = env::var(IDIOMS_ENV).is_ok();
+        ret.primary_package = env::var("CARGO_PRIMARY_PACKAGE").is_ok();
         ret
     }
 
@@ -534,19 +558,14 @@ impl FixArgs {
             .arg("--cap-lints=warn");
         if let Some(edition) = &self.enabled_edition {
             cmd.arg("--edition").arg(edition);
-            if self.idioms {
+            if self.idioms && self.primary_package {
                 if edition == "2018" { cmd.arg("-Wrust-2018-idioms"); }
             }
         }
-        match &self.prepare_for_edition {
-            PrepareFor::Edition(edition) => {
+        if self.primary_package {
+            if let Some(edition) = self.prepare_for_edition_resolve() {
                 cmd.arg("-W").arg(format!("rust-{}-compatibility", edition));
             }
-            PrepareFor::Next => {
-                let edition = self.next_edition();
-                cmd.arg("-W").arg(format!("rust-{}-compatibility", edition));
-            }
-            PrepareFor::None => {}
         }
     }
 
@@ -558,10 +577,9 @@ impl FixArgs {
     /// actually be able to fix anything! If it looks like this is happening
     /// then yield an error to the user, indicating that this is happening.
     fn verify_not_preparing_for_enabled_edition(&self) -> CargoResult<()> {
-        let edition = match &self.prepare_for_edition {
-            PrepareFor::Edition(s) => s,
-            PrepareFor::Next => self.next_edition(),
-            PrepareFor::None => return Ok(()),
+        let edition = match self.prepare_for_edition_resolve() {
+            Some(s) => s,
+            None => return Ok(()),
         };
         let enabled = match &self.enabled_edition {
             Some(s) => s,
@@ -583,37 +601,12 @@ impl FixArgs {
         process::exit(1);
     }
 
-    /// If we're preparing for an edition and we *don't* find the
-    /// `rust_2018_preview` feature, for example, in the entry point file then
-    /// it probably means that the edition isn't actually enabled, so we can't
-    /// actually fix anything.
-    ///
-    /// If this is the case, issue a warning.
-    fn warn_if_preparing_probably_inert(&self) -> CargoResult<()> {
-        let edition = match &self.prepare_for_edition {
-            PrepareFor::Edition(s) => s,
-            PrepareFor::Next => self.next_edition(),
-            PrepareFor::None => return Ok(()),
-        };
-        let path = match &self.file {
-            Some(s) => s,
-            None => return Ok(()),
-        };
-        let contents = match fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(_) => return Ok(())
-        };
-
-        let feature_name = format!("rust_{}_preview", edition);
-        if contents.contains(&feature_name) {
-            return Ok(())
+    fn prepare_for_edition_resolve(&self) -> Option<&str> {
+        match &self.prepare_for_edition {
+            PrepareFor::Edition(s) => Some(s),
+            PrepareFor::Next => Some(self.next_edition()),
+            PrepareFor::None => None,
         }
-        Message::PreviewNotFound {
-            file: path.display().to_string(),
-            edition: edition.to_string(),
-        }.post()?;
-
-        Ok(())
     }
 
     fn next_edition(&self) -> &str {

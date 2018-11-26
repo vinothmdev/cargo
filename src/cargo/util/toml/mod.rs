@@ -18,8 +18,8 @@ use core::profiles::Profiles;
 use core::{Dependency, Manifest, PackageId, Summary, Target};
 use core::{Edition, EitherManifest, Feature, Features, VirtualManifest};
 use core::{GitReference, PackageIdSpec, SourceId, WorkspaceConfig, WorkspaceRootConfig};
-use sources::CRATES_IO;
-use util::errors::{CargoError, CargoResult, CargoResultExt};
+use sources::{CRATES_IO_INDEX, CRATES_IO_REGISTRY};
+use util::errors::{CargoError, CargoResult, CargoResultExt, ManifestError};
 use util::paths;
 use util::{self, Config, ToUrl};
 
@@ -30,17 +30,17 @@ pub fn read_manifest(
     path: &Path,
     source_id: &SourceId,
     config: &Config,
-) -> CargoResult<(EitherManifest, Vec<PathBuf>)> {
+) -> Result<(EitherManifest, Vec<PathBuf>), ManifestError> {
     trace!(
         "read_manifest; path={}; source-id={}",
         path.display(),
         source_id
     );
-    let contents = paths::read(path)?;
+    let contents = paths::read(path).map_err(|err| ManifestError::new(err, path.into()))?;
 
-    let ret = do_read_manifest(&contents, path, source_id, config)
-        .chain_err(|| format!("failed to parse manifest at `{}`", path.display()))?;
-    Ok(ret)
+    do_read_manifest(&contents, path, source_id, config)
+        .chain_err(|| format!("failed to parse manifest at `{}`", path.display()))
+        .map_err(|err| ManifestError::new(err, path.into()))
 }
 
 fn do_read_manifest(
@@ -810,6 +810,16 @@ impl TomlManifest {
             bail!("package name cannot be an empty string")
         }
 
+        for c in package_name.chars() {
+            if c.is_alphanumeric() {
+                continue;
+            }
+            if c == '_' || c == '-' {
+                continue;
+            }
+            bail!("Invalid character `{}` in package name: `{}`", c, package_name)
+        }
+
         let pkgid = project.to_package_id(source_id)?;
 
         let edition = if let Some(ref edition) = project.edition {
@@ -1076,6 +1086,24 @@ impl TomlManifest {
         if me.bench.is_some() {
             bail!("virtual manifests do not specify [[bench]]");
         }
+        if me.dependencies.is_some() {
+            bail!("virtual manifests do not specify [dependencies]");
+        }
+        if me.dev_dependencies.is_some() || me.dev_dependencies2.is_some() {
+            bail!("virtual manifests do not specify [dev-dependencies]");
+        }
+        if me.build_dependencies.is_some() || me.build_dependencies2.is_some() {
+            bail!("virtual manifests do not specify [build-dependencies]");
+        }
+        if me.features.is_some() {
+            bail!("virtual manifests do not specify [features]");
+        }
+        if me.target.is_some() {
+            bail!("virtual manifests do not specify [target]");
+        }
+        if me.badges.is_some() {
+            bail!("virtual manifests do not specify [badges]");
+        }
 
         let mut nested_paths = Vec::new();
         let mut warnings = Vec::new();
@@ -1130,7 +1158,7 @@ impl TomlManifest {
                 )
             })?;
             if spec.url().is_none() {
-                spec.set_url(CRATES_IO.parse().unwrap());
+                spec.set_url(CRATES_IO_INDEX.parse().unwrap());
             }
 
             let version_specified = match *replacement {
@@ -1165,7 +1193,7 @@ impl TomlManifest {
         let mut patch = HashMap::new();
         for (url, deps) in self.patch.iter().flat_map(|x| x) {
             let url = match &url[..] {
-                "crates-io" => CRATES_IO.parse().unwrap(),
+                CRATES_IO_REGISTRY => CRATES_IO_INDEX.parse().unwrap(),
                 _ => url.to_url()?,
             };
             patch.insert(
@@ -1239,7 +1267,7 @@ impl TomlDependency {
 impl DetailedTomlDependency {
     fn to_dependency(
         &self,
-        name: &str,
+        name_in_toml: &str,
         cx: &mut Context,
         kind: Option<Kind>,
     ) -> CargoResult<Dependency> {
@@ -1249,7 +1277,7 @@ impl DetailedTomlDependency {
                  providing a local path, Git repository, or \
                  version to use. This will be considered an \
                  error in future versions",
-                name
+                name_in_toml
             );
             cx.warnings.push(msg);
         }
@@ -1266,7 +1294,7 @@ impl DetailedTomlDependency {
                     let msg = format!(
                         "key `{}` is ignored for dependency ({}). \
                          This will be considered an error in future versions",
-                        key_name, name
+                        key_name, name_in_toml
                     );
                     cx.warnings.push(msg)
                 }
@@ -1290,12 +1318,12 @@ impl DetailedTomlDependency {
             (Some(_), _, Some(_), _) | (Some(_), _, _, Some(_)) => bail!(
                 "dependency ({}) specification is ambiguous. \
                  Only one of `git` or `registry` is allowed.",
-                name
+                name_in_toml
             ),
             (_, _, Some(_), Some(_)) => bail!(
                 "dependency ({}) specification is ambiguous. \
                  Only one of `registry` or `registry-index` is allowed.",
-                name
+                name_in_toml
             ),
             (Some(git), maybe_path, _, _) => {
                 if maybe_path.is_some() {
@@ -1303,7 +1331,7 @@ impl DetailedTomlDependency {
                         "dependency ({}) specification is ambiguous. \
                          Only one of `git` or `path` is allowed. \
                          This will be considered an error in future versions",
-                        name
+                        name_in_toml
                     );
                     cx.warnings.push(msg)
                 }
@@ -1318,7 +1346,7 @@ impl DetailedTomlDependency {
                         "dependency ({}) specification is ambiguous. \
                          Only one of `branch`, `tag` or `rev` is allowed. \
                          This will be considered an error in future versions",
-                        name
+                        name_in_toml
                     );
                     cx.warnings.push(msg)
                 }
@@ -1359,15 +1387,15 @@ impl DetailedTomlDependency {
             (None, None, None, None) => SourceId::crates_io(cx.config)?,
         };
 
-        let (pkg_name, rename) = match self.package {
-            Some(ref s) => (&s[..], Some(name)),
-            None => (name, None),
+        let (pkg_name, explicit_name_in_toml) = match self.package {
+            Some(ref s) => (&s[..], Some(name_in_toml)),
+            None => (name_in_toml, None),
         };
 
         let version = self.version.as_ref().map(|v| &v[..]);
         let mut dep = match cx.pkgid {
             Some(id) => Dependency::parse(pkg_name, version, &new_source_id, id, cx.config)?,
-            None => Dependency::parse_no_deprecated(name, version, &new_source_id)?,
+            None => Dependency::parse_no_deprecated(pkg_name, version, &new_source_id)?,
         };
         dep.set_features(self.features.iter().flat_map(|x| x))
             .set_default_features(
@@ -1381,9 +1409,9 @@ impl DetailedTomlDependency {
         if let Some(kind) = kind {
             dep.set_kind(kind);
         }
-        if let Some(rename) = rename {
+        if let Some(name_in_toml) = explicit_name_in_toml {
             cx.features.require(Feature::rename_dependency())?;
-            dep.set_rename(rename);
+            dep.set_explicit_name_in_toml(name_in_toml);
         }
         Ok(dep)
     }
@@ -1464,7 +1492,14 @@ impl TomlTarget {
     }
 
     fn proc_macro(&self) -> Option<bool> {
-        self.proc_macro.or(self.proc_macro2)
+        self.proc_macro.or(self.proc_macro2).or_else(|| {
+            if let Some(types) = self.crate_types() {
+                if types.contains(&"proc-macro".to_string()) {
+                    return Some(true);
+                }
+            }
+            None
+        })
     }
 
     fn crate_types(&self) -> Option<&Vec<String>> {
